@@ -2,16 +2,12 @@ name = "habiss-haba"
 main = "src/worker/index.js"
 compatibility_date = "2026-09-01"
 
-# Serve the static frontend (src/frontend) from the same Worker.
-# Requests that don't match /api/* fall through to these assets.
 [assets]
 directory = "src/frontend"
 binding = "ASSETS"
-
-# SPA-style: unknown paths return index.html so the app shell always loads.
 not_found_handling = "single-page-application"
+run_worker_first = ["/api/*"]
 
-# Cloudflare D1 database binding.
 [[d1_databases]]
 binding = "DB"
 database_name = "habiss-haba-db"
