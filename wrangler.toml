@@ -7,13 +7,13 @@ compatibility_date = "2026-09-01"
 [assets]
 directory = "src/frontend"
 binding = "ASSETS"
+
 # SPA-style: unknown paths return index.html so the app shell always loads.
 not_found_handling = "single-page-application"
 
 # Cloudflare D1 database binding.
-# Create the DB with:  npm run db:create
-# then paste the printed database_id below (replace TO_BE_FILLED).
 [[d1_databases]]
 binding = "DB"
 database_name = "habiss-haba-db"
-database_id = "dd970f66-7103-4f6c-ae7b-273bda4777fa"migrations_dir = "migrations"
+database_id = "dd970f66-7103-4f6c-ae7b-273bda4777fa"
+migrations_dir = "migrations"
