@@ -1,0 +1,20 @@
+name = "habiss-haba"
+main = "src/worker/index.js"
+compatibility_date = "2026-09-01"
+
+# Serve the static frontend (src/frontend) from the same Worker.
+# Requests that don't match /api/* fall through to these assets.
+[assets]
+directory = "src/frontend"
+binding = "ASSETS"
+# SPA-style: unknown paths return index.html so the app shell always loads.
+not_found_handling = "single-page-application"
+
+# Cloudflare D1 database binding.
+# Create the DB with:  npm run db:create
+# then paste the printed database_id below (replace TO_BE_FILLED).
+[[d1_databases]]
+binding = "DB"
+database_name = "habiss-haba-db"
+database_id = "TO_BE_FILLED"
+migrations_dir = "migrations"

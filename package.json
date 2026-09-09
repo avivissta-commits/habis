@@ -1,0 +1,19 @@
+{
+  "name": "habiss-haba",
+  "version": "1.0.0",
+  "description": "הביס הבא — restaurant wishlist app. Cloudflare Worker + D1 backend serving a static frontend.",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "db:create": "wrangler d1 create habiss-haba-db",
+    "db:migrate": "wrangler d1 migrations apply habiss-haba-db --remote",
+    "db:migrate:local": "wrangler d1 migrations apply habiss-haba-db --local",
+    "db:console": "wrangler d1 execute habiss-haba-db --remote --command \"SELECT id,name FROM restaurants\"",
+    "tail": "wrangler tail"
+  },
+  "devDependencies": {
+    "wrangler": "^3.90.0"
+  }
+}
