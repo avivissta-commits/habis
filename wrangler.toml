@@ -16,5 +16,4 @@ not_found_handling = "single-page-application"
 [[d1_databases]]
 binding = "DB"
 database_name = "habiss-haba-db"
-database_id = "TO_BE_FILLED"
-migrations_dir = "migrations"
+database_id = "dd970f66-7103-4f6c-ae7b-273bda4777fa"migrations_dir = "migrations"
