@@ -1,32 +1,24 @@
 (function(){
 "use strict";
 const KEY='next-bite-v1';            // local CACHE of restaurants (not the source of truth)
-const UIKEY='next-bite-ui';          // local UI prefs only (sort, last tab, etc.)
-const API_BASE='/api';               // same-origin Worker API
-
-/* ================= API CLIENT ================= *
- * The source of truth for restaurants is Cloudflare D1, reached through these calls.
- * DATA.restaurants is an in-memory working copy kept in sync so the existing (synchronous)
- * UI code keeps working unchanged; a small local cache lets the app paint instantly and
- * survive brief offline moments. */
+const UIKEY='next-bite-ui';          // local UI prefs only
+const API_BASE='/api';
 const api={
   async list(){ const r=await fetch(API_BASE+'/restaurants'); if(!r.ok) throw new Error('list '+r.status); return r.json(); },
   async create(obj){ const r=await fetch(API_BASE+'/restaurants',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(obj)}); if(!r.ok) throw new Error('create '+r.status); return r.json(); },
   async update(id,obj){ const r=await fetch(API_BASE+'/restaurants/'+encodeURIComponent(id),{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify(obj)}); if(!r.ok) throw new Error('update '+r.status); return r.json(); },
   async remove(id){ const r=await fetch(API_BASE+'/restaurants/'+encodeURIComponent(id),{method:'DELETE'}); if(!r.ok && r.status!==404) throw new Error('delete '+r.status); return true; },
 };
-// Fields the DB owns; everything sent to the API is the full restaurant object.
 function toApiPayload(r){
   const o={};
   ['name','cuisines','city','area','address','mapUrl','website','bookingUrl','menuUrl','deliveryUrl',
-   'phone','visitStatus','craving','priceLevel','occasions','tags','dishesToTry','happyHours',
+   'phone','openingHours','visitStatus','craving','priceLevel','occasions','tags','dishesToTry','happyHours',
    'whySaved','notes','images','sourceUrl','emoji','themeKey','visits','visitCount','nextUp']
    .forEach(k=>{ if(r[k]!==undefined) o[k]=r[k]; });
   return o;
 }
-// track ids that only exist locally (created while offline / awaiting server id)
 const pendingSync=new Set();
-const pendingDelete=new Map();  // id -> timeout handle (deferred server delete during undo window)
+const pendingDelete=new Map();
 const DAYS=['א׳','ב׳','ג׳','ד׳','ה׳','ו׳','ש׳'];
 const DAYS_FULL=['ראשון','שני','שלישי','רביעי','חמישי','שישי','שבת'];
 
@@ -328,6 +320,8 @@ const AI_TEMPLATE = (function(){
 'עיר — העיר (לדוגמה: תל אביב).',
 'אזור — השכונה/האזור (לדוגמה: פלורנטין, לב העיר).',
 'כתובת — כתובת מלאה: רחוב, מספר ועיר. משמשת לכפתור "נווט" ולשורת הכתובת.',
+'שעות פתיחה — ימים ושעות הפעילות של המקום. מופיע בשורת "שעות פתיחה" בפרטים.',
+'  אפשר לפרט כמה טווחים, מופרדים בפסיקים. לדוגמה: "א׳–ה׳ 12:00-23:00, ו׳ 10:00-17:00, שבת סגור".',
 '',
 '[קישורים]',
 'מפות — קישור Google Maps (אם קיים). אם ריק, הניווט מתבצע לפי הכתובת.',
@@ -373,7 +367,7 @@ const AI_TEMPLATE = (function(){
 '──────────────────',
 'מלא/י והחזר/י רק את הטופס הבא:',
 '',
-'[מסעדה]','שם:','מטבח:','עיר:','אזור:','כתובת:','',
+'[מסעדה]','שם:','מטבח:','עיר:','אזור:','כתובת:','שעות פתיחה:','',
 '[קישורים]','מפות:','אתר:','הזמנה:','תפריט:','משלוח:','טלפון:','',
 '[מה חשוב]','סטטוס:','חשק:','הבא בתור:','מחיר:','מתאים ל:','תגיות:','',
 '[Happy Hour]','ימים:','שעות:','הטבה:','תנאים:','',
@@ -395,6 +389,7 @@ const KEY_ALIASES={
   'תפריט':'menuUrl','menu':'menuUrl',
   'משלוח':'deliveryUrl','delivery':'deliveryUrl','טייק אוואי':'deliveryUrl','טייקאווי':'deliveryUrl','wolt':'deliveryUrl',
   'טלפון':'phone','טל':'phone','phone':'phone','tel':'phone',
+  'שעות פתיחה':'openingHours','שעות פעילות':'openingHours','opening hours':'openingHours','hours open':'openingHours','שעות עבודה':'openingHours',
   'סטטוס':'status','status':'status',
   'חשק':'craving','craving':'craving',
   'הבא בתור':'nextUp','next up':'nextUp',
@@ -499,6 +494,7 @@ function parseImport(raw){
   if(f.menuUrl) d.menuUrl=f.menuUrl;
   if(f.deliveryUrl) d.deliveryUrl=f.deliveryUrl;
   if(f.phone) d.phone=f.phone;
+  if(f.openingHours) d.openingHours=f.openingHours;
   if(f.sourceUrl) d.sourceUrl=f.sourceUrl;
   if(f.image){ const imgs=splitMulti(f.image).filter(u=>/^(https?:|data:)/i.test(u.trim())); if(imgs.length) d.images=imgs; }
   if(f.occasions) d.occasions=splitMulti(f.occasions);
@@ -604,13 +600,10 @@ function chooseForMe(list, now, avoidId){
 }
 
 /* ---------- state ---------- */
-// DATA is the in-memory working copy. Source of truth = Cloudflare D1 (via api.*).
-// We hydrate from a local cache first for instant paint, then refresh from the server.
 let DATA=loadCache();
 const UI={screen:{kind:'home'}, query:'', filters:emptyFilters(), lastChosenId:null};
 let SNACK=null, SNACK_T=null, TRASH=null;
 
-// Local CACHE only (not the source of truth). UI prefs stored separately under UIKEY.
 function loadCache(){
   let settings={sortMode:'smart',recentSearches:[]};
   try{ const s=JSON.parse(localStorage.getItem(UIKEY)||'null'); if(s&&typeof s==='object') settings={...settings,...s}; }catch(e){}
@@ -618,16 +611,14 @@ function loadCache(){
   try{ const raw=JSON.parse(localStorage.getItem(KEY)||'null'); if(raw&&Array.isArray(raw.restaurants)) restaurants=raw.restaurants; }catch(e){}
   return {restaurants, settings};
 }
-function persist(){ // write the restaurant cache + UI prefs
+function persist(){
   try{ localStorage.setItem(KEY,JSON.stringify({restaurants:DATA.restaurants})); }catch(e){}
   try{ localStorage.setItem(UIKEY,JSON.stringify(DATA.settings||{})); }catch(e){}
 }
-function persistPrefs(){ try{ localStorage.setItem(UIKEY,JSON.stringify(DATA.settings||{})); }catch(e){} }
 function liveList(){ return DATA.restaurants.filter(r=>!r.deleted); }
 function getR(id){ return DATA.restaurants.find(r=>String(r.id)===String(id)); }
 function sortMode(){ return DATA.settings.sortMode||'smart'; }
 
-// Load restaurants from the API and refresh the UI. Falls back to cache (then seed) if offline.
 async function bootstrap(){
   try{
     const list=await api.list();
@@ -635,13 +626,11 @@ async function bootstrap(){
     persist();
     if(typeof render==='function') render();
   }catch(e){
-    // API unreachable: keep whatever cache we have; if totally empty, fall back to bundled seed
     if(!DATA.restaurants.length && typeof seed==='function'){ DATA.restaurants=seed(); persist(); if(typeof render==='function') render(); }
     console.warn('API unavailable, using local data:', e && e.message);
   }
 }
 
-// Create or update a restaurant. Updates memory + cache instantly, then syncs to D1.
 function upsert(r){
   r.updatedAt=nowIso();
   const i=DATA.restaurants.findIndex(x=>String(x.id)===String(r.id));
@@ -655,18 +644,16 @@ async function syncUpsert(r){
     if(isServerId(r.id)){
       await api.update(r.id, toApiPayload(r));
     }else{
-      // new local record -> create on server, then swap the temp id for the real one
       const tempId=r.id;
       const created=await api.create(toApiPayload(r));
       if(created && created.id!=null){
         const rec=DATA.restaurants.find(x=>String(x.id)===String(tempId));
         if(rec){ rec.id=created.id; }
         if(UI.lastChosenId===tempId) UI.lastChosenId=created.id;
-        // if the user is currently viewing this just-created place, keep the view pointed at it
         if(UI.screen && UI.screen.kind==='detail' && String(UI.screen.id)===String(tempId)) UI.screen.id=created.id;
         pendingSync.delete(tempId);
         persist();
-        if(typeof render==='function') render();   // refresh cards so data-id reflects the server id
+        if(typeof render==='function') render();
       }
     }
   }catch(e){ pendingSync.add(r.id); console.warn('sync upsert failed:', e && e.message); }
@@ -675,7 +662,6 @@ function setNextUp(id){
   const prev=DATA.restaurants.find(r=>r.nextUp && String(r.id)!==String(id));
   DATA.restaurants.forEach(r=>{ r.nextUp=(String(r.id)===String(id)); });
   persist();
-  // sync both the newly-set and the previously-set restaurant
   const cur=getR(id); if(cur) syncUpsert(cur);
   if(prev) syncUpsert(prev);
   return prev?prev.id:null;
@@ -1110,6 +1096,14 @@ function renderDetail(id){
   if(website) det.push('<button class="nd-detrow tap" data-act="web" data-id="'+r.id+'"><span class="dlabel">אתר</span><span class="dval"><span>'+esc(String(website).replace(/^https?:\/\//,'').replace(/\/$/,''))+'</span>'+uic('ic-globe',17)+'</span></button>');
   if(r.deliveryUrl) det.push('<button class="nd-detrow tap" data-act="delivery" data-id="'+r.id+'"><span class="dlabel">משלוח</span><span class="dval"><span>'+esc(String(r.deliveryUrl).replace(/^https?:\/\//,'').replace(/\/$/,''))+'</span>'+uic('ic-delivery',17)+'</span></button>');
   if(address) det.push('<button class="nd-detrow tap" data-act="nav" data-id="'+r.id+'"><span class="dlabel">כתובת</span><span class="dval"><span>'+esc(address)+'</span>'+uic('ic-navpin',17)+'</span></button>');
+  if(r.openingHours){
+    // Opening hours may hold several day/time segments (comma-separated) — show them stacked and readable.
+    const segs=String(r.openingHours).split(/[,،]|\n/).map(s=>s.trim()).filter(Boolean);
+    const hoursVal = segs.length>1
+      ? '<span class="nd-hours-list">'+segs.map(s=>'<span>'+esc(s)+'</span>').join('')+'</span>'
+      : '<span>'+esc(r.openingHours)+'</span>';
+    det.push('<div class="nd-detrow'+(segs.length>1?' nd-detrow-hours':'')+'"><span class="dlabel">שעות פתיחה</span><span class="dval">'+hoursVal+uic('ic-clock',17)+'</span></div>');
+  }
   let detHtml = det.length? '<div class="nd-card nd-details"><div class="nd-card-hd"><h3>פרטים</h3></div>'+det.join('')+'</div>':'';
 
   // Preserve remaining info: why saved / notes / visits (compact cards)
@@ -1418,12 +1412,10 @@ function openDelete(id){
   node.querySelector('[data-del]').onclick=()=>{
     r.deleted=true; const wasNext=r.nextUp; r.nextUp=false; persist();
     closeModal(); go({kind:'home'});
-    // Defer the server delete until the undo window passes, so "ביטול" is instant and lossless.
     const delId=r.id;
     if(isServerId(delId)){
       const h=setTimeout(()=>{
         pendingDelete.delete(delId);
-        // remove locally + on server once the user did NOT undo
         const idx=DATA.restaurants.findIndex(x=>String(x.id)===String(delId));
         if(idx>=0 && DATA.restaurants[idx].deleted){ DATA.restaurants.splice(idx,1); persist(); }
         api.remove(delId).catch(e=>console.warn('delete sync failed:', e && e.message));
@@ -1433,8 +1425,7 @@ function openDelete(id){
     snackbar(r.name+' הוסר','ביטול',()=>{
       r.deleted=false; if(wasNext && !liveList().some(x=>x.nextUp)) r.nextUp=true; persist();
       const h=pendingDelete.get(delId); if(h){ clearTimeout(h); pendingDelete.delete(delId); }
-      syncUpsert(r);   // make sure server reflects the restored state
-      render();
+      syncUpsert(r); render();
     },6000);
   };
   openModal(node,false);
@@ -1486,6 +1477,7 @@ function openAddEdit(mode, id, prefill){
     +'<div class="af-field"><span>מתאים ל</span><div class="af-help">אפשר לבחור כמה</div><div class="af-tags" id="f-occ-tags"></div><input type="hidden" id="f-occ"></div>'
     +'<button type="button" class="disclosure tap" id="f-more-btn"><span class="disc-arrow">▾</span> <span class="disc-txt">הוסף עוד פרטים</span></button>'
     +'<div id="f-more" class="af-collapse"><div class="af-collapse-inner">'
+      +'<label class="field"><span>שעות פתיחה</span><textarea class="inp" id="f-hours" rows="2" placeholder="א׳–ה׳ 12:00-23:00, ו׳ 10:00-17:00, שבת סגור">'+esc(val('openingHours'))+'</textarea></label>'
       +'<label class="field"><span>תגיות</span><input class="inp" id="f-tags" value="'+esc((d.tags||[]).join(', '))+'"></label>'
       +'<label class="field"><span>מנות שרוצה לנסות</span><input class="inp" id="f-dishes" value="'+esc((d.dishesToTry||[]).join(', '))+'"></label>'
       +'<label class="field"><span>למה שמרתי</span><textarea class="inp" id="f-why">'+esc(val('whySaved'))+'</textarea></label>'
@@ -1621,6 +1613,7 @@ function openAddEdit(mode, id, prefill){
     r.city=node.querySelector('#f-city').value.trim()||undefined;
     r.area=node.querySelector('#f-area').value.trim()||undefined;
     r.address=node.querySelector('#f-address').value.trim()||undefined;
+    r.openingHours=((node.querySelector('#f-hours')||{}).value||'').trim()||undefined;
     r.priceLevel=price||undefined;
     r.visitStatus=visited?'visited':'notVisited';
     r.occasions=splitList((node.querySelector('#f-occ')||{}).value);
@@ -1689,6 +1682,7 @@ function openImport(){
       if(draft.cuisines) rows.push(field('p-cuisines','מטבח', draft.cuisines.join(', ')));
       if(draft.city!=null||draft.area!=null) rows.push('<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">'+field('p-city','עיר',draft.city)+field('p-area','אזור',draft.area)+'</div>');
       if(draft.address!=null) rows.push(field('p-address','כתובת', draft.address));
+      if(draft.openingHours!=null) rows.push(area('p-hours','שעות פתיחה', draft.openingHours));
       if(draft.dishesToTry) rows.push(field('p-dishes','רוצה לנסות', draft.dishesToTry.join(', ')));
       if(draft.whySaved!=null) rows.push(area('p-why','למה שמרתי', draft.whySaved));
       if(draft.notes!=null) rows.push(area('p-notes','הערות', draft.notes));
@@ -1750,6 +1744,7 @@ function openImport(){
         if(node.querySelector('#p-city')) d.city=g('p-city')||undefined;
         if(node.querySelector('#p-area')) d.area=g('p-area')||undefined;
         if(node.querySelector('#p-address')) d.address=g('p-address')||undefined;
+        if(node.querySelector('#p-hours')) d.openingHours=g('p-hours')||undefined;
         if(node.querySelector('#p-dishes')) d.dishesToTry=splitList(g('p-dishes'));
         if(node.querySelector('#p-why')) d.whySaved=g('p-why')||undefined;
         if(node.querySelector('#p-notes')) d.notes=g('p-notes')||undefined;
@@ -1765,7 +1760,7 @@ function openImport(){
         const wantNext = !!d.nextUp && (!existingNext || doReplace);
         const r={id:uid(),createdAt:nowIso(),updatedAt:nowIso(),visits:[],visitCount:0,
           name:d.name, cuisines:d.cuisines||[], city:d.city||undefined, area:d.area||undefined, address:d.address||undefined,
-          mapUrl:d.mapUrl||undefined, website:d.website||undefined, bookingUrl:d.bookingUrl||undefined, menuUrl:d.menuUrl||undefined, deliveryUrl:d.deliveryUrl||undefined, phone:d.phone||undefined, sourceUrl:d.sourceUrl||undefined, images:(d.images||undefined), image:d.image||undefined,
+          mapUrl:d.mapUrl||undefined, website:d.website||undefined, bookingUrl:d.bookingUrl||undefined, menuUrl:d.menuUrl||undefined, deliveryUrl:d.deliveryUrl||undefined, phone:d.phone||undefined, openingHours:d.openingHours||undefined, sourceUrl:d.sourceUrl||undefined, images:(d.images||undefined), image:d.image||undefined,
           visitStatus:d.visitStatus||'notVisited', cravingLevel:d.cravingLevel||undefined, priceLevel:d.priceLevel||undefined,
           occasions:d.occasions||[], tags:d.tags||[], dishesToTry:d.dishesToTry||[], whySaved:d.whySaved||undefined, notes:d.notes||undefined,
           happyHours:(d.happyHours||[]), nextUp:false };
@@ -1884,43 +1879,43 @@ document.body.addEventListener('click',e=>{
 function daysAgo(n){return new Date(Date.now()-n*86400000).toISOString();}
 function seed(){
   return [
-    {id:uid(), name:'Gaijin Izakaya', cuisines:['אסייתי','דגים','שף'], city:'תל אביב', area:'לב העיר', address:'לילינבלום 29, תל אביב', phone:'052-3119298', priceLevel:4, visitStatus:'notVisited', visitCount:0, nextUp:false, occasions:['ערב','דרינק','דייט','עם חברים','חגיגה','אווירה','ערב מיוחד'], tags:['יפני','איזקאיה','סושי','סשימי','סאקה','גריל יפני'], dishesToTry:[], happyHours:[], visits:[], createdAt:daysAgo(1), updatedAt:daysAgo(1)},
-    {id:uid(), name:'קפה טאיזו', deliveryUrl:'https://wolt.com/he/isr/tel-aviv/restaurant/cafe-taizu', cuisines:['אסייתי','שף'], city:'תל אביב', area:'מרכז העיר', address:'דרך מנחם בגין 23, תל אביב', notes:'הכתובת העדכנית: דרך מנחם בגין 23.', priceLevel:3, visitStatus:'notVisited', visitCount:0, nextUp:false, occasions:['צהריים','ערב','דייט','עם חברים','משפחה','אווירה'], tags:['אסייתי','יובל בן נריה','דרום מזרח אסיה'], dishesToTry:[], happyHours:[], visits:[], createdAt:daysAgo(2), updatedAt:daysAgo(2)},
-    {id:uid(), name:'Joseph \'N\' Sons', cuisines:['דגים'], city:'תל אביב', area:'כיכר רבין', address:'מלכי ישראל 10, תל אביב', phone:'03-9611141', deliveryUrl:'https://wolt.com/he/isr/tel-aviv/restaurant/joseph-n-sons', priceLevel:2, visitStatus:'notVisited', visitCount:0, nextUp:false, occasions:['צהריים','ערב','עם חברים','משפחה','קליל','משהו מהיר','ישיבה בחוץ'], tags:['פיש אנד צ׳יפס','סלמון בורגר','דגים','קלמרי','שרימפס'], dishesToTry:[], happyHours:[], visits:[], createdAt:daysAgo(3), updatedAt:daysAgo(3)},
-    {id:uid(), name:'Rothschild 48 Brasserie', cuisines:['שף','ים תיכוני','דגים'], city:'תל אביב', area:'לב העיר', address:'שדרות רוטשילד 48, תל אביב', phone:'03-5560011', priceLevel:4, visitStatus:'notVisited', visitCount:0, nextUp:false, occasions:['צהריים','ערב','דרינק','דייט','חגיגה','אווירה','ערב מיוחד'], tags:['בראסרי','R2M','רותי ברודו','מלון R48'], dishesToTry:[], happyHours:[], visits:[], createdAt:daysAgo(4), updatedAt:daysAgo(4)},
-    {id:uid(), name:'רובע א׳', cuisines:['ים תיכוני','דגים','שף'], city:'תל אביב', area:'נווה צדק', address:'יהושע התלמי 18, תל אביב', phone:'053-5500605', notes:'מסעדה כשרה חלבית ודגים.', priceLevel:3, visitStatus:'notVisited', visitCount:0, nextUp:false, occasions:['ערב','דייט','חגיגה','אווירה','ערב מיוחד','ישיבה בחוץ'], tags:['כשר','חלבי','דגים','אביתר מלכה','מלון אלקונין'], dishesToTry:[], happyHours:[], visits:[], createdAt:daysAgo(5), updatedAt:daysAgo(5)},
-    {id:uid(), name:'WABI Ramen', cuisines:['אסייתי'], city:'תל אביב', area:'לב העיר', address:'דה פיג׳וטו 23, תל אביב', priceLevel:2, visitStatus:'notVisited', visitCount:0, nextUp:false, occasions:['צהריים','ערב','עם חברים','קליל','משהו מהיר'], tags:['יפני','ראמן','אטריות בעבודת יד','דין שושני'], dishesToTry:[], happyHours:[], visits:[], createdAt:daysAgo(6), updatedAt:daysAgo(6)},
-    {id:uid(), name:'נאם', cuisines:['אסייתי'], city:'תל אביב', area:'הצפון הישן', address:'דיזנגוף 293, תל אביב', phone:'03-6708050', deliveryUrl:'https://wolt.com/he/isr/tel-aviv/restaurant/nam-dizengoff', priceLevel:2, visitStatus:'notVisited', visitCount:0, nextUp:false, occasions:['צהריים','ערב','דייט','עם חברים','משפחה','קליל'], tags:['תאילנדי','קארי','נודלס','פירות ים'], dishesToTry:[], happyHours:[], visits:[], createdAt:daysAgo(7), updatedAt:daysAgo(7)},
-    {id:uid(), name:'אנסטסיה', cuisines:['בית קפה'], city:'תל אביב', area:'מרכז העיר', address:'פרישמן 54, תל אביב', phone:'03-5290095', deliveryUrl:'https://wolt.com/he/isr/tel-aviv/restaurant/anastasia', priceLevel:2, visitStatus:'notVisited', visitCount:0, nextUp:false, occasions:['ארוחת בוקר','בראנץ׳','צהריים','ערב','דייט','קליל','רגוע'], tags:['טבעוני','בריאות','ללא סוכר לבן','ללא קמח לבן'], dishesToTry:[], happyHours:[], visits:[], createdAt:daysAgo(8), updatedAt:daysAgo(8)},
-    {id:uid(), name:'טאלי לאמה', cuisines:['אסייתי'], city:'תל אביב', area:'מרכז העיר', address:'דרך מנחם בגין 48, תל אביב', phone:'051-2608026', deliveryUrl:'https://wolt.com/he/isr/tel-aviv/restaurant/tali-lama-tlv', notes:'ישיבה במקום א׳–ה׳ 11:00-15:30.', priceLevel:2, visitStatus:'notVisited', visitCount:0, nextUp:false, occasions:['צהריים','קליל','משהו מהיר'], tags:['הודי','טבעוני','כשר','ללא גלוטן','תבשילים'], dishesToTry:[], happyHours:[], visits:[], createdAt:daysAgo(9), updatedAt:daysAgo(9)},
-    {id:uid(), name:'הקטן', cuisines:['שף','דגים','ישראלי'], city:'תל אביב', area:'שוק לוינסקי', address:'לוינסקי 46, תל אביב', priceLevel:3, visitStatus:'notVisited', visitCount:0, nextUp:false, occasions:['ערב','דרינק','דייט','עם חברים','אווירה','ישיבה בחוץ'], tags:['עידו קבלן','שוק לוינסקי','יין','אוכל ישראלי עכשווי'], dishesToTry:[], happyHours:[], visits:[], createdAt:daysAgo(10), updatedAt:daysAgo(10)},
-    {id:uid(), name:'Sachi Ramen & Sushi', cuisines:['אסייתי','דגים'], city:'תל אביב', area:'כיכר דיזנגוף', address:'דיזנגוף 98, תל אביב', phone:'054-5370076', deliveryUrl:'https://wolt.com/he/isr/tel-aviv/restaurant/sachi-sushi-tlv', priceLevel:2, visitStatus:'notVisited', visitCount:0, nextUp:false, occasions:['צהריים','ערב','דייט','עם חברים','קליל'], tags:['יפני','ראמן','סושי','סשימי'], dishesToTry:[], happyHours:[{id:uid(),enabled:true,days:[0,1,2,3,4],start:'12:30',end:'15:00',offer:'20% הנחה על מנות פתיחה, סושי, בירה ויין',conditions:'לא כולל ראמן; לא תקף בחגים ובאירועים מיוחדים'},{id:uid(),enabled:true,days:[0,1,2,3,4],start:'17:00',end:'20:00',offer:'20% הנחה על מנות פתיחה, סושי, בירה ויין',conditions:'לא כולל ראמן; לא תקף בחגים ובאירועים מיוחדים'}], visits:[], createdAt:daysAgo(11), updatedAt:daysAgo(11)},
-    {id:uid(), name:'Thai 148', cuisines:['אסייתי'], city:'תל אביב', area:'הצפון הישן', address:'דיזנגוף 148, תל אביב', phone:'053-5430586', notes:'עסקית א׳–ד׳ 12:00-16:00 עם 15% הנחה על התפריט.', priceLevel:2, visitStatus:'notVisited', visitCount:0, nextUp:false, occasions:['צהריים','ערב','דרינק','דייט','עם חברים','אווירה'], tags:['תאילנדי','קוקטיילים'], dishesToTry:[], happyHours:[{id:uid(),enabled:true,days:[0,1,2,3,4,6],start:'17:00',end:'19:00',offer:'20% הנחה על האלכוהול',conditions:'לא מתקיים ביום שישי'}], visits:[], createdAt:daysAgo(12), updatedAt:daysAgo(12)},
-    {id:uid(), name:'גברת קוואיטיאו', cuisines:['אסייתי'], city:'תל אביב', area:'שוק הכרמל', address:'יום טוב 2, תל אביב', phone:'053-8848618', priceLevel:2, visitStatus:'notVisited', visitCount:0, nextUp:false, occasions:['צהריים','ערב','קליל','משהו מהיר','ישיבה בחוץ'], tags:['תאילנדי','אוכל רחוב','קוואי טיאו','שוק הכרמל'], dishesToTry:[], happyHours:[], visits:[], createdAt:daysAgo(13), updatedAt:daysAgo(13)},
-    {id:uid(), name:'ASA Izakaya', cuisines:['אסייתי','דגים'], city:'תל אביב', area:'לב העיר', address:'אחד העם 54, תל אביב', phone:'03-3752977', priceLevel:3, visitStatus:'notVisited', visitCount:0, nextUp:false, occasions:['ערב','דרינק','דייט','עם חברים','חגיגה','אווירה','ערב מיוחד'], tags:['יפני','איזקאיה','אירורי','סושי','גיוזה','ראמן','אודון','טמפורה','יקיטורי'], dishesToTry:[], happyHours:[], visits:[], createdAt:daysAgo(14), updatedAt:daysAgo(14)},
-    {id:uid(), name:'Kimura-ya.J', cuisines:['אסייתי'], city:'תל אביב', area:'לב העיר', address:'מזא״ה 3, תל אביב', phone:'055-2996579', notes:'פתוח ב׳–ש׳ 18:00-00:00; הזמנה אחרונה ב-23:00.', priceLevel:2, visitStatus:'notVisited', visitCount:0, nextUp:false, occasions:['ערב','דייט','עם חברים','קליל','אווירה'], tags:['יפני','איזקאיה','ראמן','סושי','יקיטורי','שאבו שאבו','סוקיאקי'], dishesToTry:[], happyHours:[], visits:[], createdAt:daysAgo(15), updatedAt:daysAgo(15)},
-    {id:uid(), name:'אליבי', cuisines:['אסייתי','דגים'], city:'תל אביב', area:'מרכז העיר', address:'פרישמן 41, תל אביב', phone:'054-5784838', deliveryUrl:'https://wolt.com/he/isr/tel-aviv/restaurant/alibi-sushi-bar', priceLevel:2, visitStatus:'notVisited', visitCount:0, nextUp:false, occasions:['ערב','דרינק','דייט','עם חברים','אחרי עבודה','אווירה','ישיבה בחוץ'], tags:['אסייתי','סושי','קוקטיילים'], dishesToTry:[], happyHours:[{id:uid(),enabled:true,days:[0,1,2,3,4],start:'18:00',end:'20:00',offer:'20% הנחה על אוכל, 40% הנחה על שתייה',conditions:'לא חל על מנות עם טונה אדומה'}], visits:[], createdAt:daysAgo(16), updatedAt:daysAgo(16)},
-    {id:uid(), name:'Saka Ba', cuisines:['אסייתי'], city:'תל אביב', area:'פלורנטין', address:'זבולון 8, תל אביב', priceLevel:2, visitStatus:'notVisited', visitCount:0, nextUp:false, occasions:['ערב','דרינק','דייט','עם חברים','אווירה'], tags:['יפני','סאקה','איזקאיה'], dishesToTry:[], happyHours:[], visits:[], createdAt:daysAgo(17), updatedAt:daysAgo(17)},
-    {id:uid(), name:'OBI', cuisines:['אסייתי','דגים'], city:'תל אביב', area:'לב העיר', address:'יבנה 31, תל אביב', phone:'077-8801744', priceLevel:3, visitStatus:'notVisited', visitCount:0, nextUp:false, occasions:['ערב','דרינק','דייט','עם חברים','אחרי עבודה','אווירה','ערב מיוחד'], tags:['יפני','איזקאיה','סאקה','גריל פחמים','מוזיקה','DJ'], dishesToTry:[], happyHours:[{id:uid(),enabled:true,days:[0,1,2,3,4],start:'18:00',end:'19:30',offer:'25% הנחה על התפריט + סאקה ללא תחתית',conditions:'סאקה ללא תחתית בהזמנת קראף'}], visits:[], createdAt:daysAgo(18), updatedAt:daysAgo(18)},
-    {id:uid(), name:'Cichukai', cuisines:['אסייתי','דגים','שף'], city:'תל אביב', area:'שוק הפשפשים', address:'עמיעד 10, יפו', phone:'03-9653565', priceLevel:3, visitStatus:'notVisited', visitCount:0, nextUp:false, occasions:['ערב','דרינק','דייט','עם חברים','אחרי עבודה','אווירה','ערב מיוחד'], tags:['יפני','פרואני','ניקיי','אור גינסברג','קוקטיילים'], dishesToTry:[], happyHours:[{id:uid(),enabled:true,days:[1,2,3,6],start:'18:00',end:'19:00',offer:'20% הנחה על יין וקוקטיילים, 10% הנחה על התפריט והספיישלים',conditions:'לא כולל ארוחה זוגית'}], visits:[], createdAt:daysAgo(19), updatedAt:daysAgo(19)},
-    {id:uid(), name:'Selas', cuisines:['אסייתי','דגים','שף'], city:'תל אביב', area:'יפו', address:'רבי תנחום 6, יפו', phone:'03-9653565', deliveryUrl:'https://wolt.com/he/isr/tel-aviv/restaurant/sales', priceLevel:3, visitStatus:'notVisited', visitCount:0, nextUp:false, occasions:['ערב','דרינק','דייט','עם חברים','חגיגה','אווירה','ערב מיוחד'], tags:['אור גינסברג','אסייתי','סושי','דגים','פיוז׳ן'], dishesToTry:[], happyHours:[{id:uid(),enabled:true,days:[1,2,3],start:'18:00',end:'19:00',offer:'20% הנחה על יין וקוקטיילים'},{id:uid(),enabled:true,days:[4,5,6],start:'17:00',end:'18:30',offer:'20% הנחה על יין וקוקטיילים'}], visits:[], createdAt:daysAgo(20), updatedAt:daysAgo(20)},
-    {id:uid(), name:'אונמי', deliveryUrl:'https://wolt.com/he/isr/tel-aviv/restaurant/onami', cuisines:['אסייתי','דגים'], city:'תל אביב', area:'מתחם הארבעה', address:'הארבעה 18, תל אביב', priceLevel:3, visitStatus:'notVisited', visitCount:0, nextUp:false, occasions:['צהריים','ערב','דייט','עם חברים','משפחה'], tags:['יפני','סושי','סשימי'], dishesToTry:[], happyHours:[], visits:[], createdAt:daysAgo(21), updatedAt:daysAgo(21)},
-    {id:uid(), name:'בטשון', cuisines:['דגים'], city:'תל אביב', area:'מרכז העיר', address:'קרליבך 29, תל אביב', phone:'077-5575315', priceLevel:2, visitStatus:'notVisited', visitCount:0, nextUp:false, occasions:['צהריים','ערב','עם חברים','קליל','משהו מהיר','ישיבה בחוץ'], tags:['דגים','פירות ים','חנות דגים','סטריט פוד'], dishesToTry:[], happyHours:[], visits:[], createdAt:daysAgo(22), updatedAt:daysAgo(22)},
-    {id:uid(), name:'האומקאסה של עומר ניצן', cuisines:['אסייתי','דגים','שף'], visitStatus:'notVisited', visitCount:0, nextUp:false, occasions:['ערב','דייט','חגיגה','ערב מיוחד'], tags:['אומקאסה','יפני'], dishesToTry:[], happyHours:[], visits:[], createdAt:daysAgo(23), updatedAt:daysAgo(23)},
-    {id:uid(), name:'UMAI', cuisines:['אסייתי','דגים','שף'], city:'תל אביב', area:'יפו', address:'עבד אל ראוף אל ביטאר 8, יפו', phone:'052-5977897', notes:'חלל אירוח אינטימי עם ערבי טעימות בהזמנה מראש.', priceLevel:4, visitStatus:'notVisited', visitCount:0, nextUp:false, occasions:['ערב','דייט','חגיגה','אווירה','ערב מיוחד'], tags:['יפני','קייסקי','ניקו קאפו','איזקאיה','אלכס אברמוב','ארוחת טעימות'], dishesToTry:[], happyHours:[], visits:[], createdAt:daysAgo(24), updatedAt:daysAgo(24)},
-    {id:uid(), name:'טראסו', cuisines:['אסייתי','דגים','שף'], city:'תל אביב', area:'יפו', address:'יפת 20, יפו', phone:'055-9899366', priceLevel:4, visitStatus:'notVisited', visitCount:0, nextUp:false, occasions:['ערב','דייט','חגיגה','אווירה','ערב מיוחד'], tags:['יפני','אומקאסה','סושי','דניאל שיף','ארוחת טעימות'], dishesToTry:[], happyHours:[], visits:[], createdAt:daysAgo(25), updatedAt:daysAgo(25)},
-    {id:uid(), name:'הגלריה של השף אורי זיסו', cuisines:['אסייתי','דגים','שף'], city:'פתח תקווה', area:'מושב רינתיה', address:'מושב רינתיה', phone:'054-6655185', notes:'אומקאסה כ-12 מנות; Pop Omakase כ-8 מנות; סיטים 18:30 ו-21:00; עד 16 סועדים.', priceLevel:4, visitStatus:'notVisited', visitCount:0, nextUp:false, occasions:['ערב','דייט','חגיגה','אווירה','ערב מיוחד'], tags:['יפני','איזקאיה','אומקאסה','ארוחת טעימות','אורי זיסו'], dishesToTry:[], happyHours:[], visits:[], createdAt:daysAgo(26), updatedAt:daysAgo(26)},
-    {id:uid(), name:'NOEMA', cuisines:['ים תיכוני','דגים','שף'], city:'תל אביב', area:'נחלת בנימין', address:'נחלת בנימין 59, תל אביב-יפו', phone:'077-9386186', menuUrl:'https://ontopo.com/he/il/page/15172114', bookingUrl:'https://ontopo.com/he/il/page/15172114', notes:'בסופי שבוע מוגש בראנץ׳ (שישי ושבת 12:00-17:00).', priceLevel:3, visitStatus:'notVisited', visitCount:0, nextUp:false, occasions:['ערב','דרינק','דייט','עם חברים','חגיגה','אווירה','ערב מיוחד'], tags:['בר אוכל','קוקטיילים','מטבח מקומי','דרך המשי','דגים','פסטות','מושיקו אברהם'], dishesToTry:[], happyHours:[{id:uid(),enabled:true,days:[0,1,2,3,4],start:'18:00',end:'20:00',offer:'20% הנחה על האוכל, 30% הנחה על האלכוהול'}], visits:[], createdAt:daysAgo(0), updatedAt:daysAgo(0)},
-    {id:uid(), name:'TYO', cuisines:['אסייתי','דגים','שף'], city:'תל אביב', area:'נווה צדק', address:'שבזי 58, תל אביב-יפו', phone:'03-9300333', deliveryUrl:'https://wolt.com/he/isr/tel-aviv/restaurant/tyo', website:'https://tyo.co.il/', menuUrl:'https://tyo.co.il/tyo-%D7%AA%D7%A4%D7%A8%D7%99%D7%98-%D7%A2%D7%A8%D7%91/', bookingUrl:'https://ontopo.com/he/il/page/tyo', notes:'א׳–ד׳ 12:00-16:00 גם הטבת צהריים של 15% הנחה על התפריט.', priceLevel:4, visitStatus:'notVisited', visitCount:0, nextUp:false, occasions:['צהריים','ערב','דרינק','דייט','עם חברים','חגיגה','אווירה','ערב מיוחד'], tags:['יפני','סושי','סשימי','סאקה','יאמה סאן','לא כשר'], dishesToTry:[], happyHours:[{id:uid(),enabled:true,days:[0,1,2,3],start:'16:00',end:'19:00',offer:'25% הנחה על כל תפריט האוכל והאלכוהול'}], visits:[], createdAt:daysAgo(0), updatedAt:daysAgo(0)},
-    {id:uid(), name:'פופינה', cuisines:['דגים','שף'], city:'תל אביב', area:'נווה צדק', address:'אחד העם 3, תל אביב-יפו', phone:'03-5757477', website:'https://www.popina.co.il/', menuUrl:'https://www.popina.co.il/menus-1', bookingUrl:'https://ontopo.com/he/il/page/popina', notes:'ארוחת טעימות 6 מנות ב-430 ₪; התאמת 5 כוסות אלכוהול ב-215 ₪.', priceLevel:4, visitStatus:'notVisited', visitCount:0, nextUp:false, occasions:['ערב','דרינק','דייט','עם חברים','חגיגה','אווירה','ערב מיוחד','ישיבה בחוץ'], tags:['אוראל קמחי','מסעדת שף','ארוחת טעימות','דגים','פירות ים','קוקטיילים','לא כשר'], dishesToTry:['ארוחת טעימות','סשימי טונה','טליוליני שרימפס','פילה דג צלוי'], happyHours:[], visits:[], createdAt:daysAgo(0), updatedAt:daysAgo(0)},
-    {id:uid(), name:'Brasserie 18', cuisines:['איטלקי','ים תיכוני','דגים'], city:'תל אביב', area:'לבונטין', address:'לבונטין 19, תל אביב-יפו', phone:'03-5472548', deliveryUrl:'https://orders.beecommcloud.com/#/sites/p-0/655eeb12d541bee19f59e443', notes:'בראסרי כשרה חלבית. שעות: א׳–ה׳ בראנץ׳ 09:30-13:00, צהריים 13:00-16:00, ערב 17:00-22:00; שישי בראנץ׳ 09:00-15:00; שבת סגור.', sourceUrl:'https://brasstlv.co.il/', website:'https://brasstlv.co.il/', bookingUrl:'https://brasstlv.co.il/', menuUrl:'https://brasstlv.co.il/menu/', priceLevel:3, visitStatus:'notVisited', visitCount:0, nextUp:false, occasions:['ארוחת בוקר','בראנץ׳','צהריים','ערב','דרינק','דייט','עם חברים','אחרי עבודה','חגיגה','רגוע','אווירה','ערב מיוחד','ישיבה בחוץ'], tags:['כשר','חלבי','בראסרי','צרפתי','אירופאי','דגים','יין'], dishesToTry:[], happyHours:[{id:uid(),enabled:true,days:[0,1,2,3,4],start:'17:00',end:'19:00',offer:'30% הנחה'}], visits:[], createdAt:daysAgo(0), updatedAt:daysAgo(0)},
-    {id:uid(), name:'מתחת לעץ', cuisines:['בית קפה','ישראלי'], city:'תל אביב', area:'הצפון הישן', address:'בן יהודה 202, תל אביב', phone:'03-6359033', deliveryUrl:'https://wolt.com/he/isr/tel-aviv/restaurant/under-the-tree', notes:'הסניף המקורי בבן יהודה 202; קיים גם סניף בלבונטין 13. פעיל לאורך רוב שעות היממה.', sourceUrl:'https://www.hashulchan.co.il/restaurant/%D7%9E%D7%AA%D7%97%D7%AA-%D7%9C%D7%A2%D7%A5/', website:'https://underthetree.co.il/', menuUrl:'https://wolt.com/he/isr/tel-aviv/restaurant/under-the-tree', priceLevel:2, visitStatus:'notVisited', visitCount:0, nextUp:false, occasions:['ארוחת בוקר','בראנץ׳','צהריים','ערב','עם חברים','משפחה','קליל','רגוע','משהו מהיר','ישיבה בחוץ'], tags:['בית קפה שכונתי','טבעוני','ללא גלוטן','ארוחות בוקר','כריכים','סלטים','בולים'], dishesToTry:[], happyHours:[], visits:[], createdAt:daysAgo(0), updatedAt:daysAgo(0)},
-    {id:uid(), name:'הכרמל 40', cuisines:['דגים'], city:'תל אביב', area:'שוק הכרמל', address:'הכרמל 40, תל אביב-יפו', phone:'054-489-8022', mapUrl:'https://www.waze.com/live-map/directions/il/tel-aviv-district/tel-aviv-yafo/%D7%94%D7%9B%D7%A8%D7%9E%D7%9C-40-hacarmel?to=place.ChIJU1A3LyxNHRURbxIdXiNg3H8', website:'https://www.facebook.com/hacarmel40', sourceUrl:'https://timeout.co.il/%D7%94%D7%9B%D7%A8%D7%9E%D7%9C-40/', notes:'המקום עובד בשיתוף עם חנות הדגים דגי רוסתום בשוק הכרמל. מנת הדגל היא "כריך דייגים" — כריך דג בסגנון באליק אקמק, עם דג טרי בלחם; ביקורות עדכניות מזכירות בין היתר גרסה עם פילה לברק, לחם/פרנה קלוי וחריף. בנוסף מופיעים סביצ׳ה אינטיאס ומנגו ומנות דגים ופירות ים מטוגנים. שעות פעילות שמופיעות כיום: א׳–ה׳ 11:00-17:30, ו׳ 10:00-17:00, שבת סגור.', priceLevel:2, visitStatus:'notVisited', visitCount:0, nextUp:false, occasions:['צהריים','עם חברים','קליל','משהו מהיר','ישיבה בחוץ'], tags:['כריך דייגים','סנדוויץ דג','דגים טריים','לברק','אינטיאס','מנגו','שוק הכרמל','דגי רוסתום','אלעד אמיתי'], dishesToTry:['כריך דייגים','סביצ׳ה אינטיאס ומנגו'], happyHours:[], visits:[], createdAt:daysAgo(0), updatedAt:daysAgo(0)},
-    {id:uid(), name:'Grinberg Burger', cuisines:['בורגר','דגים'], city:'תל אביב', area:'לב העיר', address:'שינקין 22, תל אביב', phone:'073-3277294', deliveryUrl:'https://wolt.com/he/isr/tel-aviv/restaurant/grinberg-burger-sheinkin', website:'https://www.grinbergburger.co.il/lp/gb', bookingUrl:'https://www.grinbergburger.co.il/lp/gb', menuUrl:'https://www.grinbergburger.co.il/warehouse/dynamic/466853.pdf', sourceUrl:'https://13tv.co.il/item/yummies/food-news/fo37g-904486793/', notes:'מנת הדג נקראת GRIN-FISH: דג ים פריך, רוטב טרטר טרגון, לימון וגבינת צ׳דר בלחמנייה. בתפריט הרשמי המחיר למנה הוא 64 ₪; ארוחת GRIN FISH ב-Wolt כוללת את כריך הדג, צ׳יפס עם כוסברה, שום ופטרוזיליה ושתייה ב-86 ₪. הסניף בשינקין פתוח לפי האתר הרשמי 12:00-22:30. למקום יש גם סניף בצפון תל אביב, גרינברג 25. לא נמצא Happy Hour קבוע ומאומת.', priceLevel:2, visitStatus:'notVisited', visitCount:0, nextUp:false, occasions:['צהריים','ערב','עם חברים','משפחה','קליל','משהו מהיר'], tags:['פיש בורגר','שניצל דג','GRIN-FISH','דג ים','טרטר טרגון','צ׳דר','לימון','המבורגר','אורי עשת'], dishesToTry:['GRIN-FISH'], happyHours:[], visits:[], createdAt:daysAgo(0), updatedAt:daysAgo(0)}
+    {id:uid(), name:'Gaijin Izakaya', cuisines:['אסייתי','דגים','שף'], city:'תל אביב', area:'לב העיר', address:'לילינבלום 29, תל אביב', openingHours:'א׳–ד׳ 18:00–23:30\nה׳ 18:00–00:00\nו׳–ש׳ סגור', phone:'052-3119298', priceLevel:4, visitStatus:'notVisited', visitCount:0, nextUp:false, occasions:['ערב','דרינק','דייט','עם חברים','חגיגה','אווירה','ערב מיוחד'], tags:['יפני','איזקאיה','סושי','סשימי','סאקה','גריל יפני'], dishesToTry:[], happyHours:[], visits:[], createdAt:daysAgo(1), updatedAt:daysAgo(1)},
+    {id:uid(), name:'קפה טאיזו', deliveryUrl:'https://wolt.com/he/isr/tel-aviv/restaurant/cafe-taizu', cuisines:['אסייתי','שף'], city:'תל אביב', area:'מרכז העיר', address:'דרך מנחם בגין 23, תל אביב', openingHours:'א׳–ו׳ 11:30–22:00\nש׳ 12:00–22:00', notes:'הכתובת העדכנית: דרך מנחם בגין 23.', priceLevel:3, visitStatus:'notVisited', visitCount:0, nextUp:false, occasions:['צהריים','ערב','דייט','עם חברים','משפחה','אווירה'], tags:['אסייתי','יובל בן נריה','דרום מזרח אסיה'], dishesToTry:[], happyHours:[], visits:[], createdAt:daysAgo(2), updatedAt:daysAgo(2)},
+    {id:uid(), name:'Joseph \'N\' Sons', cuisines:['דגים'], city:'תל אביב', area:'כיכר רבין', address:'מלכי ישראל 10, תל אביב', openingHours:'א׳–ד׳, ש׳ 11:30–23:30\nה׳ 11:30–00:30\nו׳ 11:30–22:00', phone:'03-9611141', deliveryUrl:'https://wolt.com/he/isr/tel-aviv/restaurant/joseph-n-sons', priceLevel:2, visitStatus:'notVisited', visitCount:0, nextUp:false, occasions:['צהריים','ערב','עם חברים','משפחה','קליל','משהו מהיר','ישיבה בחוץ'], tags:['פיש אנד צ׳יפס','סלמון בורגר','דגים','קלמרי','שרימפס'], dishesToTry:[], happyHours:[], visits:[], createdAt:daysAgo(3), updatedAt:daysAgo(3)},
+    {id:uid(), name:'Rothschild 48 Brasserie', cuisines:['שף','ים תיכוני','דגים'], city:'תל אביב', area:'לב העיר', address:'שדרות רוטשילד 48, תל אביב', openingHours:'א׳–ו׳ 12:00–23:00\nש׳ סגור', phone:'03-5560011', priceLevel:4, visitStatus:'notVisited', visitCount:0, nextUp:false, occasions:['צהריים','ערב','דרינק','דייט','חגיגה','אווירה','ערב מיוחד'], tags:['בראסרי','R2M','רותי ברודו','מלון R48'], dishesToTry:[], happyHours:[], visits:[], createdAt:daysAgo(4), updatedAt:daysAgo(4)},
+    {id:uid(), name:'רובע א׳', cuisines:['ים תיכוני','דגים','שף'], city:'תל אביב', area:'נווה צדק', address:'יהושע התלמי 18, תל אביב', openingHours:'א׳–ה׳ 18:00–01:00\nו׳–ש׳ סגור', phone:'053-5500605', notes:'מסעדה כשרה חלבית ודגים.', priceLevel:3, visitStatus:'notVisited', visitCount:0, nextUp:false, occasions:['ערב','דייט','חגיגה','אווירה','ערב מיוחד','ישיבה בחוץ'], tags:['כשר','חלבי','דגים','אביתר מלכה','מלון אלקונין'], dishesToTry:[], happyHours:[], visits:[], createdAt:daysAgo(5), updatedAt:daysAgo(5)},
+    {id:uid(), name:'WABI Ramen', cuisines:['אסייתי'], city:'תל אביב', area:'לב העיר', address:'דה פיג׳וטו 23, תל אביב', openingHours:'א׳ 12:30–22:00\nב׳–ד׳ 12:00–22:00\nה׳ 12:00–22:30\nו׳–ש׳ סגור', priceLevel:2, visitStatus:'notVisited', visitCount:0, nextUp:false, occasions:['צהריים','ערב','עם חברים','קליל','משהו מהיר'], tags:['יפני','ראמן','אטריות בעבודת יד','דין שושני'], dishesToTry:[], happyHours:[], visits:[], createdAt:daysAgo(6), updatedAt:daysAgo(6)},
+    {id:uid(), name:'נאם', cuisines:['אסייתי'], city:'תל אביב', area:'הצפון הישן', address:'דיזנגוף 293, תל אביב', openingHours:'א׳–ש׳ 12:00–16:00, 17:00–23:00', phone:'03-6708050', deliveryUrl:'https://wolt.com/he/isr/tel-aviv/restaurant/nam-dizengoff', priceLevel:2, visitStatus:'notVisited', visitCount:0, nextUp:false, occasions:['צהריים','ערב','דייט','עם חברים','משפחה','קליל'], tags:['תאילנדי','קארי','נודלס','פירות ים'], dishesToTry:[], happyHours:[], visits:[], createdAt:daysAgo(7), updatedAt:daysAgo(7)},
+    {id:uid(), name:'אנסטסיה', cuisines:['בית קפה'], city:'תל אביב', area:'מרכז העיר', address:'פרישמן 54, תל אביב', openingHours:'א׳–ה׳ 08:30–22:00\nו׳ 09:00–16:00\nש׳ 10:00–16:00', phone:'03-5290095', deliveryUrl:'https://wolt.com/he/isr/tel-aviv/restaurant/anastasia', priceLevel:2, visitStatus:'notVisited', visitCount:0, nextUp:false, occasions:['ארוחת בוקר','בראנץ׳','צהריים','ערב','דייט','קליל','רגוע'], tags:['טבעוני','בריאות','ללא סוכר לבן','ללא קמח לבן'], dishesToTry:[], happyHours:[], visits:[], createdAt:daysAgo(8), updatedAt:daysAgo(8)},
+    {id:uid(), name:'טאלי לאמה', cuisines:['אסייתי'], city:'תל אביב', area:'מרכז העיר', address:'דרך מנחם בגין 48, תל אביב', openingHours:'א׳–ה׳ 11:00–22:30\nו׳–ש׳ סגור', phone:'051-2608026', deliveryUrl:'https://wolt.com/he/isr/tel-aviv/restaurant/tali-lama-tlv', notes:'ישיבה במקום א׳–ה׳ 11:00-15:30.', priceLevel:2, visitStatus:'notVisited', visitCount:0, nextUp:false, occasions:['צהריים','קליל','משהו מהיר'], tags:['הודי','טבעוני','כשר','ללא גלוטן','תבשילים'], dishesToTry:[], happyHours:[], visits:[], createdAt:daysAgo(9), updatedAt:daysAgo(9)},
+    {id:uid(), name:'הקטן', cuisines:['שף','דגים','ישראלי'], city:'תל אביב', area:'שוק לוינסקי', address:'לוינסקי 46, תל אביב', openingHours:'ב׳–ה׳ 18:00–00:00\nו׳ 10:00–18:00\nא׳, ש׳ סגור', priceLevel:3, visitStatus:'notVisited', visitCount:0, nextUp:false, occasions:['ערב','דרינק','דייט','עם חברים','אווירה','ישיבה בחוץ'], tags:['עידו קבלן','שוק לוינסקי','יין','אוכל ישראלי עכשווי'], dishesToTry:[], happyHours:[], visits:[], createdAt:daysAgo(10), updatedAt:daysAgo(10)},
+    {id:uid(), name:'Sachi Ramen & Sushi', cuisines:['אסייתי','דגים'], city:'תל אביב', area:'כיכר דיזנגוף', address:'דיזנגוף 98, תל אביב', openingHours:'ב׳–ד׳, ו׳–ש׳ 12:00–23:00\nה׳ 12:00–00:00\nא׳ סגור', phone:'054-5370076', deliveryUrl:'https://wolt.com/he/isr/tel-aviv/restaurant/sachi-sushi-tlv', priceLevel:2, visitStatus:'notVisited', visitCount:0, nextUp:false, occasions:['צהריים','ערב','דייט','עם חברים','קליל'], tags:['יפני','ראמן','סושי','סשימי'], dishesToTry:[], happyHours:[{id:uid(),enabled:true,days:[0,1,2,3,4],start:'12:30',end:'15:00',offer:'20% הנחה על מנות פתיחה, סושי, בירה ויין',conditions:'לא כולל ראמן; לא תקף בחגים ובאירועים מיוחדים'},{id:uid(),enabled:true,days:[0,1,2,3,4],start:'17:00',end:'20:00',offer:'20% הנחה על מנות פתיחה, סושי, בירה ויין',conditions:'לא כולל ראמן; לא תקף בחגים ובאירועים מיוחדים'}], visits:[], createdAt:daysAgo(11), updatedAt:daysAgo(11)},
+    {id:uid(), name:'Thai 148', cuisines:['אסייתי'], city:'תל אביב', area:'הצפון הישן', address:'דיזנגוף 148, תל אביב', openingHours:'א׳–ש׳ 12:00–23:30', phone:'053-5430586', notes:'עסקית א׳–ד׳ 12:00-16:00 עם 15% הנחה על התפריט.', priceLevel:2, visitStatus:'notVisited', visitCount:0, nextUp:false, occasions:['צהריים','ערב','דרינק','דייט','עם חברים','אווירה'], tags:['תאילנדי','קוקטיילים'], dishesToTry:[], happyHours:[{id:uid(),enabled:true,days:[0,1,2,3,4,6],start:'17:00',end:'19:00',offer:'20% הנחה על האלכוהול',conditions:'לא מתקיים ביום שישי'}], visits:[], createdAt:daysAgo(12), updatedAt:daysAgo(12)},
+    {id:uid(), name:'גברת קוואיטיאו', cuisines:['אסייתי'], city:'תל אביב', area:'שוק הכרמל', address:'יום טוב 2, תל אביב', openingHours:'ב׳–ד׳ 11:00–22:30\nה׳ 11:00–23:00\nו׳ 09:00–17:00\nא׳, ש׳ סגור', phone:'053-8848618', priceLevel:2, visitStatus:'notVisited', visitCount:0, nextUp:false, occasions:['צהריים','ערב','קליל','משהו מהיר','ישיבה בחוץ'], tags:['תאילנדי','אוכל רחוב','קוואי טיאו','שוק הכרמל'], dishesToTry:[], happyHours:[], visits:[], createdAt:daysAgo(13), updatedAt:daysAgo(13)},
+    {id:uid(), name:'ASA Izakaya', cuisines:['אסייתי','דגים'], city:'תל אביב', area:'לב העיר', address:'אחד העם 54, תל אביב', openingHours:'א׳–ה׳, ש׳ 17:00–23:30\nו׳ סגור', phone:'03-3752977', priceLevel:3, visitStatus:'notVisited', visitCount:0, nextUp:false, occasions:['ערב','דרינק','דייט','עם חברים','חגיגה','אווירה','ערב מיוחד'], tags:['יפני','איזקאיה','אירורי','סושי','גיוזה','ראמן','אודון','טמפורה','יקיטורי'], dishesToTry:[], happyHours:[], visits:[], createdAt:daysAgo(14), updatedAt:daysAgo(14)},
+    {id:uid(), name:'Kimura-ya.J', cuisines:['אסייתי'], city:'תל אביב', area:'לב העיר', address:'מזא״ה 3, תל אביב', openingHours:'ב׳–ה׳ 18:00–23:00\nו׳–ש׳ 12:00–16:30, 18:00–23:00\nא׳ סגור', phone:'055-2996579', notes:'פתוח ב׳–ש׳ 18:00-00:00; הזמנה אחרונה ב-23:00.', priceLevel:2, visitStatus:'notVisited', visitCount:0, nextUp:false, occasions:['ערב','דייט','עם חברים','קליל','אווירה'], tags:['יפני','איזקאיה','ראמן','סושי','יקיטורי','שאבו שאבו','סוקיאקי'], dishesToTry:[], happyHours:[], visits:[], createdAt:daysAgo(15), updatedAt:daysAgo(15)},
+    {id:uid(), name:'אליבי', cuisines:['אסייתי','דגים'], city:'תל אביב', area:'מרכז העיר', address:'פרישמן 41, תל אביב', openingHours:'א׳–ה׳ 18:00–03:00\nו׳ 13:00–03:00\nש׳ 16:00–03:00', phone:'054-5784838', deliveryUrl:'https://wolt.com/he/isr/tel-aviv/restaurant/alibi-sushi-bar', priceLevel:2, visitStatus:'notVisited', visitCount:0, nextUp:false, occasions:['ערב','דרינק','דייט','עם חברים','אחרי עבודה','אווירה','ישיבה בחוץ'], tags:['אסייתי','סושי','קוקטיילים'], dishesToTry:[], happyHours:[{id:uid(),enabled:true,days:[0,1,2,3,4],start:'18:00',end:'20:00',offer:'20% הנחה על אוכל, 40% הנחה על שתייה',conditions:'לא חל על מנות עם טונה אדומה'}], visits:[], createdAt:daysAgo(16), updatedAt:daysAgo(16)},
+    {id:uid(), name:'Saka Ba', cuisines:['אסייתי'], city:'תל אביב', area:'פלורנטין', address:'זבולון 8, תל אביב', openingHours:'א׳–ג׳ 17:00–01:00\nד׳ 17:00–02:00\nה׳ 17:00–03:00\nו׳ 12:00–01:00\nש׳ 17:00–01:00', priceLevel:2, visitStatus:'notVisited', visitCount:0, nextUp:false, occasions:['ערב','דרינק','דייט','עם חברים','אווירה'], tags:['יפני','סאקה','איזקאיה'], dishesToTry:[], happyHours:[], visits:[], createdAt:daysAgo(17), updatedAt:daysAgo(17)},
+    {id:uid(), name:'OBI', cuisines:['אסייתי','דגים'], city:'תל אביב', area:'לב העיר', address:'יבנה 31, תל אביב', openingHours:'א׳–ה׳, ש׳ 18:00–00:30\nו׳ סגור', phone:'077-8801744', priceLevel:3, visitStatus:'notVisited', visitCount:0, nextUp:false, occasions:['ערב','דרינק','דייט','עם חברים','אחרי עבודה','אווירה','ערב מיוחד'], tags:['יפני','איזקאיה','סאקה','גריל פחמים','מוזיקה','DJ'], dishesToTry:[], happyHours:[{id:uid(),enabled:true,days:[0,1,2,3,4],start:'18:00',end:'19:30',offer:'25% הנחה על התפריט + סאקה ללא תחתית',conditions:'סאקה ללא תחתית בהזמנת קראף'}], visits:[], createdAt:daysAgo(18), updatedAt:daysAgo(18)},
+    {id:uid(), name:'Cichukai', cuisines:['אסייתי','דגים','שף'], city:'תל אביב', area:'שוק הפשפשים', address:'עמיעד 10, יפו', openingHours:'ב׳–ה׳ 18:00–22:30\nו׳ 14:00–22:00\nש׳ 18:00–22:30\nא׳ סגור', phone:'03-9653565', priceLevel:3, visitStatus:'notVisited', visitCount:0, nextUp:false, occasions:['ערב','דרינק','דייט','עם חברים','אחרי עבודה','אווירה','ערב מיוחד'], tags:['יפני','פרואני','ניקיי','אור גינסברג','קוקטיילים'], dishesToTry:[], happyHours:[{id:uid(),enabled:true,days:[1,2,3,6],start:'18:00',end:'19:00',offer:'20% הנחה על יין וקוקטיילים, 10% הנחה על התפריט והספיישלים',conditions:'לא כולל ארוחה זוגית'}], visits:[], createdAt:daysAgo(19), updatedAt:daysAgo(19)},
+    {id:uid(), name:'Selas', cuisines:['אסייתי','דגים','שף'], city:'תל אביב', area:'יפו', address:'רבי תנחום 6, יפו', openingHours:'ב׳–ה׳, ש׳ 19:00–22:30\nו׳ 18:00–22:30\nא׳ סגור', phone:'03-9653565', deliveryUrl:'https://wolt.com/he/isr/tel-aviv/restaurant/sales', priceLevel:3, visitStatus:'notVisited', visitCount:0, nextUp:false, occasions:['ערב','דרינק','דייט','עם חברים','חגיגה','אווירה','ערב מיוחד'], tags:['אור גינסברג','אסייתי','סושי','דגים','פיוז׳ן'], dishesToTry:[], happyHours:[{id:uid(),enabled:true,days:[1,2,3],start:'18:00',end:'19:00',offer:'20% הנחה על יין וקוקטיילים'},{id:uid(),enabled:true,days:[4,5,6],start:'17:00',end:'18:30',offer:'20% הנחה על יין וקוקטיילים'}], visits:[], createdAt:daysAgo(20), updatedAt:daysAgo(20)},
+    {id:uid(), name:'אונמי', deliveryUrl:'https://wolt.com/he/isr/tel-aviv/restaurant/onami', cuisines:['אסייתי','דגים'], city:'תל אביב', area:'מתחם הארבעה', address:'הארבעה 18, תל אביב', openingHours:'א׳–ש׳ 12:00–23:00', priceLevel:3, visitStatus:'notVisited', visitCount:0, nextUp:false, occasions:['צהריים','ערב','דייט','עם חברים','משפחה'], tags:['יפני','סושי','סשימי'], dishesToTry:[], happyHours:[], visits:[], createdAt:daysAgo(21), updatedAt:daysAgo(21)},
+    {id:uid(), name:'בטשון', cuisines:['דגים'], city:'תל אביב', area:'מרכז העיר', address:'קרליבך 29, תל אביב', openingHours:'ב׳–ה׳ 09:00–19:00\nו׳ 08:00–16:00\nש׳ 09:00–18:00\nא׳ סגור', phone:'077-5575315', priceLevel:2, visitStatus:'notVisited', visitCount:0, nextUp:false, occasions:['צהריים','ערב','עם חברים','קליל','משהו מהיר','ישיבה בחוץ'], tags:['דגים','פירות ים','חנות דגים','סטריט פוד'], dishesToTry:[], happyHours:[], visits:[], createdAt:daysAgo(22), updatedAt:daysAgo(22)},
+    {id:uid(), name:'האומקאסה של עומר ניצן', openingHours:'לפי מועדי אירועים אין שעות פתיחה קבועות', cuisines:['אסייתי','דגים','שף'], visitStatus:'notVisited', visitCount:0, nextUp:false, occasions:['ערב','דייט','חגיגה','ערב מיוחד'], tags:['אומקאסה','יפני'], dishesToTry:[], happyHours:[], visits:[], createdAt:daysAgo(23), updatedAt:daysAgo(23)},
+    {id:uid(), name:'UMAI', cuisines:['אסייתי','דגים','שף'], city:'תל אביב', area:'יפו', address:'עבד אל ראוף אל ביטאר 8, יפו', openingHours:'בתיאום ובהזמנה מראש אין ימים ושעות קבועים', phone:'052-5977897', notes:'חלל אירוח אינטימי עם ערבי טעימות בהזמנה מראש.', priceLevel:4, visitStatus:'notVisited', visitCount:0, nextUp:false, occasions:['ערב','דייט','חגיגה','אווירה','ערב מיוחד'], tags:['יפני','קייסקי','ניקו קאפו','איזקאיה','אלכס אברמוב','ארוחת טעימות'], dishesToTry:[], happyHours:[], visits:[], createdAt:daysAgo(24), updatedAt:daysAgo(24)},
+    {id:uid(), name:'טראסו', cuisines:['אסייתי','דגים','שף'], city:'תל אביב', area:'יפו', address:'יפת 20, יפו', openingHours:'ד׳–ש׳ 20:30–00:00; לפי סבבים ובהזמנה\nא׳–ג׳ סגור', phone:'055-9899366', priceLevel:4, visitStatus:'notVisited', visitCount:0, nextUp:false, occasions:['ערב','דייט','חגיגה','אווירה','ערב מיוחד'], tags:['יפני','אומקאסה','סושי','דניאל שיף','ארוחת טעימות'], dishesToTry:[], happyHours:[], visits:[], createdAt:daysAgo(25), updatedAt:daysAgo(25)},
+    {id:uid(), name:'הגלריה של השף אורי זיסו', cuisines:['אסייתי','דגים','שף'], city:'פתח תקווה', area:'מושב רינתיה', address:'מושב רינתיה', openingHours:'לפי תאריכים המתפרסמים מדי חודש סבבים ב־18:45 וב־21:30', phone:'054-6655185', notes:'אומקאסה כ-12 מנות; Pop Omakase כ-8 מנות; סיטים 18:30 ו-21:00; עד 16 סועדים.', priceLevel:4, visitStatus:'notVisited', visitCount:0, nextUp:false, occasions:['ערב','דייט','חגיגה','אווירה','ערב מיוחד'], tags:['יפני','איזקאיה','אומקאסה','ארוחת טעימות','אורי זיסו'], dishesToTry:[], happyHours:[], visits:[], createdAt:daysAgo(26), updatedAt:daysAgo(26)},
+    {id:uid(), name:'NOEMA', cuisines:['ים תיכוני','דגים','שף'], city:'תל אביב', area:'נחלת בנימין', address:'נחלת בנימין 59, תל אביב-יפו', openingHours:'א׳ 18:00–00:00\nב׳–ד׳ 18:00–01:00\nה׳ 18:00–02:00\nו׳–ש׳ 12:00–01:00', phone:'077-9386186', menuUrl:'https://ontopo.com/he/il/page/15172114', bookingUrl:'https://ontopo.com/he/il/page/15172114', notes:'בסופי שבוע מוגש בראנץ׳ (שישי ושבת 12:00-17:00).', priceLevel:3, visitStatus:'notVisited', visitCount:0, nextUp:false, occasions:['ערב','דרינק','דייט','עם חברים','חגיגה','אווירה','ערב מיוחד'], tags:['בר אוכל','קוקטיילים','מטבח מקומי','דרך המשי','דגים','פסטות','מושיקו אברהם'], dishesToTry:[], happyHours:[{id:uid(),enabled:true,days:[0,1,2,3,4],start:'18:00',end:'20:00',offer:'20% הנחה על האוכל, 30% הנחה על האלכוהול'}], visits:[], createdAt:daysAgo(0), updatedAt:daysAgo(0)},
+    {id:uid(), name:'TYO', cuisines:['אסייתי','דגים','שף'], city:'תל אביב', area:'נווה צדק', address:'שבזי 58, תל אביב-יפו', openingHours:'א׳–ד׳, ו׳ 12:00–00:00\nה׳, ש׳ 12:00–01:00', phone:'03-9300333', deliveryUrl:'https://wolt.com/he/isr/tel-aviv/restaurant/tyo', website:'https://tyo.co.il/', menuUrl:'https://tyo.co.il/tyo-%D7%AA%D7%A4%D7%A8%D7%99%D7%98-%D7%A2%D7%A8%D7%91/', bookingUrl:'https://ontopo.com/he/il/page/tyo', notes:'א׳–ד׳ 12:00-16:00 גם הטבת צהריים של 15% הנחה על התפריט.', priceLevel:4, visitStatus:'notVisited', visitCount:0, nextUp:false, occasions:['צהריים','ערב','דרינק','דייט','עם חברים','חגיגה','אווירה','ערב מיוחד'], tags:['יפני','סושי','סשימי','סאקה','יאמה סאן','לא כשר'], dishesToTry:[], happyHours:[{id:uid(),enabled:true,days:[0,1,2,3],start:'16:00',end:'19:00',offer:'25% הנחה על כל תפריט האוכל והאלכוהול'}], visits:[], createdAt:daysAgo(0), updatedAt:daysAgo(0)},
+    {id:uid(), name:'פופינה', cuisines:['דגים','שף'], city:'תל אביב', area:'נווה צדק', address:'אחד העם 3, תל אביב-יפו', openingHours:'ב׳–ו׳ 18:00–23:00\nא׳, ש׳ סגור', phone:'03-5757477', website:'https://www.popina.co.il/', menuUrl:'https://www.popina.co.il/menus-1', bookingUrl:'https://ontopo.com/he/il/page/popina', notes:'ארוחת טעימות 6 מנות ב-430 ₪; התאמת 5 כוסות אלכוהול ב-215 ₪.', priceLevel:4, visitStatus:'notVisited', visitCount:0, nextUp:false, occasions:['ערב','דרינק','דייט','עם חברים','חגיגה','אווירה','ערב מיוחד','ישיבה בחוץ'], tags:['אוראל קמחי','מסעדת שף','ארוחת טעימות','דגים','פירות ים','קוקטיילים','לא כשר'], dishesToTry:['ארוחת טעימות','סשימי טונה','טליוליני שרימפס','פילה דג צלוי'], happyHours:[], visits:[], createdAt:daysAgo(0), updatedAt:daysAgo(0)},
+    {id:uid(), name:'Brasserie 18', cuisines:['איטלקי','ים תיכוני','דגים'], city:'תל אביב', area:'לבונטין', address:'לבונטין 19, תל אביב-יפו', openingHours:'א׳–ה׳ 09:30–16:00, 17:00–22:00\nו׳ 09:00–15:00\nש׳ סגור', phone:'03-5472548', deliveryUrl:'https://orders.beecommcloud.com/#/sites/p-0/655eeb12d541bee19f59e443', notes:'בראסרי כשרה חלבית. שעות: א׳–ה׳ בראנץ׳ 09:30-13:00, צהריים 13:00-16:00, ערב 17:00-22:00; שישי בראנץ׳ 09:00-15:00; שבת סגור.', sourceUrl:'https://brasstlv.co.il/', website:'https://brasstlv.co.il/', bookingUrl:'https://brasstlv.co.il/', menuUrl:'https://brasstlv.co.il/menu/', priceLevel:3, visitStatus:'notVisited', visitCount:0, nextUp:false, occasions:['ארוחת בוקר','בראנץ׳','צהריים','ערב','דרינק','דייט','עם חברים','אחרי עבודה','חגיגה','רגוע','אווירה','ערב מיוחד','ישיבה בחוץ'], tags:['כשר','חלבי','בראסרי','צרפתי','אירופאי','דגים','יין'], dishesToTry:[], happyHours:[{id:uid(),enabled:true,days:[0,1,2,3,4],start:'17:00',end:'19:00',offer:'30% הנחה'}], visits:[], createdAt:daysAgo(0), updatedAt:daysAgo(0)},
+    {id:uid(), name:'מתחת לעץ', cuisines:['בית קפה','ישראלי'], city:'תל אביב', area:'הצפון הישן', address:'בן יהודה 202, תל אביב', openingHours:'א׳–ה׳, ש׳ 07:00–01:00\nו׳ 07:00–16:00', phone:'03-6359033', deliveryUrl:'https://wolt.com/he/isr/tel-aviv/restaurant/under-the-tree', notes:'הסניף המקורי בבן יהודה 202; קיים גם סניף בלבונטין 13. פעיל לאורך רוב שעות היממה.', sourceUrl:'https://www.hashulchan.co.il/restaurant/%D7%9E%D7%AA%D7%97%D7%AA-%D7%9C%D7%A2%D7%A5/', website:'https://underthetree.co.il/', menuUrl:'https://wolt.com/he/isr/tel-aviv/restaurant/under-the-tree', priceLevel:2, visitStatus:'notVisited', visitCount:0, nextUp:false, occasions:['ארוחת בוקר','בראנץ׳','צהריים','ערב','עם חברים','משפחה','קליל','רגוע','משהו מהיר','ישיבה בחוץ'], tags:['בית קפה שכונתי','טבעוני','ללא גלוטן','ארוחות בוקר','כריכים','סלטים','בולים'], dishesToTry:[], happyHours:[], visits:[], createdAt:daysAgo(0), updatedAt:daysAgo(0)},
+    {id:uid(), name:'הכרמל 40', cuisines:['דגים'], city:'תל אביב', area:'שוק הכרמל', address:'הכרמל 40, תל אביב-יפו', openingHours:'א׳–ה׳ 10:30–16:30\nו׳ 10:00–16:00\nש׳ סגור', phone:'054-489-8022', mapUrl:'https://www.waze.com/live-map/directions/il/tel-aviv-district/tel-aviv-yafo/%D7%94%D7%9B%D7%A8%D7%9E%D7%9C-40-hacarmel?to=place.ChIJU1A3LyxNHRURbxIdXiNg3H8', website:'https://www.facebook.com/hacarmel40', sourceUrl:'https://timeout.co.il/%D7%94%D7%9B%D7%A8%D7%9E%D7%9C-40/', notes:'המקום עובד בשיתוף עם חנות הדגים דגי רוסתום בשוק הכרמל. מנת הדגל היא "כריך דייגים" — כריך דג בסגנון באליק אקמק, עם דג טרי בלחם; ביקורות עדכניות מזכירות בין היתר גרסה עם פילה לברק, לחם/פרנה קלוי וחריף. בנוסף מופיעים סביצ׳ה אינטיאס ומנגו ומנות דגים ופירות ים מטוגנים. שעות פעילות שמופיעות כיום: א׳–ה׳ 11:00-17:30, ו׳ 10:00-17:00, שבת סגור.', priceLevel:2, visitStatus:'notVisited', visitCount:0, nextUp:false, occasions:['צהריים','עם חברים','קליל','משהו מהיר','ישיבה בחוץ'], tags:['כריך דייגים','סנדוויץ דג','דגים טריים','לברק','אינטיאס','מנגו','שוק הכרמל','דגי רוסתום','אלעד אמיתי'], dishesToTry:['כריך דייגים','סביצ׳ה אינטיאס ומנגו'], happyHours:[], visits:[], createdAt:daysAgo(0), updatedAt:daysAgo(0)},
+    {id:uid(), name:'Grinberg Burger', cuisines:['בורגר','דגים'], city:'תל אביב', area:'לב העיר', address:'שינקין 22, תל אביב', openingHours:'א׳–ש׳ 12:00–22:30', phone:'073-3277294', deliveryUrl:'https://wolt.com/he/isr/tel-aviv/restaurant/grinberg-burger-sheinkin', website:'https://www.grinbergburger.co.il/lp/gb', bookingUrl:'https://www.grinbergburger.co.il/lp/gb', menuUrl:'https://www.grinbergburger.co.il/warehouse/dynamic/466853.pdf', sourceUrl:'https://13tv.co.il/item/yummies/food-news/fo37g-904486793/', notes:'מנת הדג נקראת GRIN-FISH: דג ים פריך, רוטב טרטר טרגון, לימון וגבינת צ׳דר בלחמנייה. בתפריט הרשמי המחיר למנה הוא 64 ₪; ארוחת GRIN FISH ב-Wolt כוללת את כריך הדג, צ׳יפס עם כוסברה, שום ופטרוזיליה ושתייה ב-86 ₪. הסניף בשינקין פתוח לפי האתר הרשמי 12:00-22:30. למקום יש גם סניף בצפון תל אביב, גרינברג 25. לא נמצא Happy Hour קבוע ומאומת.', priceLevel:2, visitStatus:'notVisited', visitCount:0, nextUp:false, occasions:['צהריים','ערב','עם חברים','משפחה','קליל','משהו מהיר'], tags:['פיש בורגר','שניצל דג','GRIN-FISH','דג ים','טרטר טרגון','צ׳דר','לימון','המבורגר','אורי עשת'], dishesToTry:['GRIN-FISH'], happyHours:[], visits:[], createdAt:daysAgo(0), updatedAt:daysAgo(0)}
   ];
 }
 
 /* ================= INIT ================= */
-render();          // paint immediately from local cache (instant)
-bootstrap();       // then load the real data from the D1-backed API and re-render
+render();          // paint immediately from local cache
+bootstrap();       // then load real data from the D1-backed API and re-render
 })();

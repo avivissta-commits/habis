@@ -208,6 +208,27 @@ saved_reason    <-> whySaved
 
 כל 33 המסעדות שהיו באפליקציה הועברו ל‑`migrations/0002_seed.sql` (כולל Happy Hours, תגיות, קישורים, `deliveryUrl` וכו׳). ה‑seed מוגן מפני כפילויות — הרצה חוזרת לא תיצור רשומות כפולות.
 
+### עדכון שעות פתיחה על DB חי (migration 0003)
+
+`migrations/0003_opening_hours.sql` מוסיף את העמודה `opening_hours` וממלא אותה לכל מסעדה קיימת לפי שם — בלי לגעת בשום שדה אחר ובלי ליצור/למחוק רשומות. זה נועד לעדכון ה‑D1 שכבר רץ בענן (שבו הנתונים הם ה‑source of truth, לא ה‑seed).
+
+הרצה על ה‑DB בענן:
+
+```bash
+npx wrangler d1 execute habiss-haba-db --remote --file=migrations/0003_opening_hours.sql
+```
+
+או מקומית:
+
+```bash
+npx wrangler d1 execute habiss-haba-db --local --file=migrations/0003_opening_hours.sql
+```
+
+הערות:
+- שורת ה‑`ALTER TABLE ... ADD COLUMN opening_hours` תיכשל בשגיאת "duplicate column" אם העמודה כבר קיימת (בדיפלוי חדש שכבר כולל אותה בסכמה) — זה בטוח להתעלם, ושאר ה‑`UPDATE`-ים ירוצו.
+- ההתאמה היא לפי **שם מדויק**. אם ערכת/שינית שם מסעדה ב‑DB החי, אותה שורה תישאר ריקה — בדוק עם `SELECT name, opening_hours FROM restaurants ORDER BY name;`, עדכן את השם בקובץ והרץ שוב (ה‑UPDATE אידמפוטנטי).
+
+
 ---
 
 ## סביבה וסודות

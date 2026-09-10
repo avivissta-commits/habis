@@ -15,6 +15,7 @@ export const SCALAR_FIELDS = {
   reservation_url: 'bookingUrl',
   menu_url: 'menuUrl',
   delivery_url: 'deliveryUrl',
+  opening_hours: 'openingHours',
   phone: 'phone',
   status: 'visitStatus',
   craving: 'craving',

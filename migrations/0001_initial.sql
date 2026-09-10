@@ -17,6 +17,7 @@ CREATE TABLE IF NOT EXISTS restaurants (
   reservation_url TEXT,
   menu_url        TEXT,
   delivery_url    TEXT,
+  opening_hours   TEXT,            -- free-form opening hours (days + times), newline-separated segments
   phone           TEXT,
 
   status          TEXT,            -- visitStatus (visited / notVisited)
