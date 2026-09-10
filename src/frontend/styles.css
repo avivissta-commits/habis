@@ -275,9 +275,19 @@
   .nd-detrow .dlabel{color:#615C58}
   .nd-detrow .dval{display:inline-flex;align-items:center;gap:7px;color:#615C58}
   .nd-detrow .em{color:var(--muted)}
-  .nd-hours-list{display:flex;flex-direction:column;align-items:flex-end;gap:2px;line-height:1.5}
-  .nd-detrow.nd-detrow-hours{align-items:flex-start;padding:11px 0}
-  .nd-detrow.nd-detrow-hours .dval{align-items:flex-start}
+  /* opening hours: header row + 2-column (days | times) grid */
+  .nd-detrow.nd-detrow-hours{flex-direction:column;align-items:stretch;gap:8px;padding:12px 0}
+  .nd-hours-head{display:flex;align-items:center;justify-content:space-between;gap:8px}
+  .nd-hours-head .dlabel{display:inline-flex;align-items:center;gap:8px;color:#615C58;font-weight:600}
+  .nd-hours-grid{display:flex;flex-direction:column;gap:5px}
+  .nd-hrow{display:flex;align-items:baseline;justify-content:space-between;gap:16px;line-height:1.5}
+  .nd-hdays{color:#615C58;font-weight:600;white-space:nowrap}
+  .nd-htime{color:#8B8580;text-align:left;direction:ltr;unicode-bidi:plaintext;white-space:nowrap}
+  .nd-hrow-free{justify-content:flex-start}
+  .nd-hrow-free span{color:#8B8580;line-height:1.5}
+  .nd-open-badge{font-size:12px;font-weight:700;padding:2px 9px;border-radius:999px;margin-inline-start:8px;white-space:nowrap}
+  .nd-open-badge.open{color:#1E7A46;background:#E6F5EC}
+  .nd-open-badge.closed{color:#9A3B3B;background:#F6E9E7}
   .nd-body-text{font-size:15px;line-height:1.6;color:#4a443f}
   .nd-visit{background:var(--soft);border-radius:14px;padding:10px 12px;margin-top:8px;font-size:14px}
   .nd-visit .vtop{display:flex;justify-content:space-between;font-weight:700}

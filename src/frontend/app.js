@@ -1,7 +1,7 @@
 (function(){
 "use strict";
-const KEY='next-bite-v1';            // local CACHE of restaurants (not the source of truth)
-const UIKEY='next-bite-ui';          // local UI prefs only
+const KEY='next-bite-v1';
+const UIKEY='next-bite-ui';
 const API_BASE='/api';
 const api={
   async list(){ const r=await fetch(API_BASE+'/restaurants'); if(!r.ok) throw new Error('list '+r.status); return r.json(); },
@@ -38,6 +38,102 @@ function normalize(s){
   return s;
 }
 const SYN={'סושי':'יפני','בורגר':'המבורגר','המבורגר':'בורגר','פסטה':'איטלקי','פיצה':'איטלקי','חומוס':'מזרחי','קפה':'בית קפה','דרינק':'בר','קוקטייל':'בר'};
+
+/* ========== opening hours: parsing, display, and isOpenNow ========== *
+ * Stored format (per restaurant, in openingHours): newline-separated segments,
+ * each "<days> <hours>", e.g.  "ב׳–ה׳ 12:00–23:00\nו׳ 12:00–22:30\nש׳ 19:00–22:30\nא׳ סגור".
+ * The days part may be a comma list of groups ("ב׳–ה׳, ש׳"); the hours part may be
+ * "סגור", one or more "HH:MM–HH:MM" ranges, or free text (which we keep for display only). */
+const HEB_DAY_IDX={'א':0,'ב':1,'ג':2,'ד':3,'ה':4,'ו':5,'ש':6}; // JS getDay(): 0=Sun(א)…6=Sat(ש)
+const DASH_RE=/[–—\-]/;            // en-dash / em-dash / hyphen
+function stripGeresh(s){ return String(s||'').replace(/[׳'’]/g,'').trim(); }
+// A real day token is a single day-letter, optionally with a geresh (א׳, ב, ...). Not a whole word.
+function hebDayIndex(tok){
+  const t=String(tok||'').trim();
+  if(!/^[אבגדהוש][׳'’]?$/.test(t)) return undefined;   // reject "בתיאום", "מראש", etc.
+  return HEB_DAY_IDX[t[0]];
+}
+// Parse a days string like "ב׳–ה׳, ש׳" -> [1,2,3,4,6]
+function parseDayList(daysStr){
+  const out=[];
+  for(let group of String(daysStr).split(/[,،]/)){
+    group=group.trim(); if(!group) continue;
+    if(DASH_RE.test(group)){
+      const [a,b]=group.split(DASH_RE).map(x=>hebDayIndex(x));
+      if(a==null||b==null) continue;
+      let i=a; // walk forward with weekly wrap (handles e.g. ו׳–א׳ if it ever occurs)
+      for(let n=0;n<7;n++){ out.push(i); if(i===b) break; i=(i+1)%7; }
+    }else{
+      const d=hebDayIndex(group); if(d!=null) out.push(d);
+    }
+  }
+  return [...new Set(out)];
+}
+// Parse the hours part -> {closed:bool, ranges:[{s,e}] , text} (s,e are minutes from midnight; e may be +24h for past-midnight)
+function parseHoursPart(hoursStr){
+  const t=String(hoursStr||'').trim();
+  if(!t) return {closed:false, ranges:[], text:''};
+  if(/^סגור/.test(t) || /^closed/i.test(t)) return {closed:true, ranges:[], text:'סגור'};
+  const ranges=[];
+  const re=/(\d{1,2}):(\d{2})\s*[–—\-]\s*(\d{1,2}):(\d{2})/g;
+  let m;
+  while((m=re.exec(t))){
+    const s=(+m[1])*60+(+m[2]);
+    let e=(+m[3])*60+(+m[4]);
+    if(e<=s) e+=24*60;          // crosses midnight (e.g. 18:00–01:00)
+    ranges.push({s,e});
+  }
+  return {closed:false, ranges, text:t};
+}
+// Split a stored openingHours string into structured segments.
+function parseOpeningHours(str){
+  const segs=[];
+  for(let raw of String(str||'').split(/\n+/)){
+    raw=raw.trim(); if(!raw) continue;
+    // find where the hours part starts: first digit, or the word "סגור"
+    let splitAt=-1;
+    const mDigit=raw.search(/\d/);
+    const mClosed=raw.search(/סגור/);
+    if(mDigit>=0 && (mClosed<0 || mDigit<mClosed)) splitAt=mDigit;
+    else if(mClosed>=0) splitAt=mClosed;
+    let daysStr, hoursStr;
+    if(splitAt>0){ daysStr=raw.slice(0,splitAt).trim(); hoursStr=raw.slice(splitAt).trim(); }
+    else { daysStr=raw; hoursStr=''; }            // no recognizable hours -> free text line
+    const days=parseDayList(daysStr);
+    const parsed=parseHoursPart(hoursStr);
+    segs.push({ daysStr, hoursStr, days, closed:parsed.closed, ranges:parsed.ranges, freeText: (!days.length && !parsed.closed && !parsed.ranges.length) });
+  }
+  return segs;
+}
+// Rows for display: [{days, hours}] — days always paired with hours; day-only rows are dropped.
+function openingHoursRows(str){
+  const rows=[];
+  for(const seg of parseOpeningHours(str)){
+    if(seg.freeText){ rows.push({days: seg.daysStr, hours:''}); continue; } // free text spans full width
+    if(!seg.hoursStr) continue;                    // §requirement: never show days without hours
+    rows.push({days: seg.daysStr, hours: seg.closed ? 'סגור' : seg.hoursStr});
+  }
+  return rows;
+}
+// Is the restaurant open right now? Returns true/false, or null when it can't be determined.
+function isOpenNow(r, now){
+  const segs = r && r.openingHours ? parseOpeningHours(r.openingHours) : [];
+  const usable = segs.filter(s=>s.days.length && (s.closed || s.ranges.length));
+  if(!usable.length) return null;                  // no real data -> unknown (treated as not-open for filter)
+  now = now || new Date();
+  const day = now.getDay();
+  const mins = now.getHours()*60 + now.getMinutes();
+  // check today, and also yesterday's past-midnight ranges spilling into today
+  const inRanges=(ranges, minutes)=> ranges.some(rg=> minutes>=rg.s && minutes<rg.e);
+  for(const seg of usable){
+    if(seg.days.includes(day) && !seg.closed && inRanges(seg.ranges, mins)) return true;
+    // yesterday spilling over past midnight (e.g. 18:00–01:00 covers 00:30 today)
+    const yday=(day+6)%7;
+    if(seg.days.includes(yday) && !seg.closed && inRanges(seg.ranges, mins+24*60)) return true;
+  }
+  return false;
+}
+
 
 /* ---------- cuisine visuals ---------- */
 const EMOJI=[
@@ -561,9 +657,10 @@ function searchList(list, q){
   out.sort((a,b)=>b.sc-a.sc);
   return out.map(x=>x.r);
 }
-function emptyFilters(){return {visitStatus:[],cuisines:[],occasions:[],areas:[],price:[],happyHour:false};}
-function activeGroups(f){let n=0;if(f.visitStatus.length)n++;if(f.cuisines.length)n++;if((f.occasions||[]).length)n++;if(f.areas.length)n++;if(f.price.length)n++;if(f.happyHour)n++;return n;}
+function emptyFilters(){return {visitStatus:[],cuisines:[],occasions:[],areas:[],price:[],happyHour:false,openNow:false};}
+function activeGroups(f){let n=0;if(f.visitStatus.length)n++;if(f.cuisines.length)n++;if((f.occasions||[]).length)n++;if(f.areas.length)n++;if(f.price.length)n++;if(f.happyHour)n++;if(f.openNow)n++;return n;}
 function applyFilters(list, f, now){
+  const t=now||new Date();
   return list.filter(r=>{
     if(f.visitStatus.length && !f.visitStatus.includes(r.visitStatus)) return false;
     if(f.cuisines.length){
@@ -580,6 +677,7 @@ function applyFilters(list, f, now){
     if(f.areas.length && !f.areas.some(a=>normalize(a)===normalize(r.area||r.city||''))) return false;
     if(f.price.length && !f.price.includes(r.priceLevel)) return false;
     if(f.happyHour){ if(!(r.happyHours||[]).some(x=>x && x.enabled)) return false; }
+    if(f.openNow){ if(isOpenNow(r,t)!==true) return false; }  // unknown/closed both excluded
     return true;
   });
 }
@@ -603,7 +701,6 @@ function chooseForMe(list, now, avoidId){
 let DATA=loadCache();
 const UI={screen:{kind:'home'}, query:'', filters:emptyFilters(), lastChosenId:null};
 let SNACK=null, SNACK_T=null, TRASH=null;
-
 function loadCache(){
   let settings={sortMode:'smart',recentSearches:[]};
   try{ const s=JSON.parse(localStorage.getItem(UIKEY)||'null'); if(s&&typeof s==='object') settings={...settings,...s}; }catch(e){}
@@ -618,7 +715,6 @@ function persist(){
 function liveList(){ return DATA.restaurants.filter(r=>!r.deleted); }
 function getR(id){ return DATA.restaurants.find(r=>String(r.id)===String(id)); }
 function sortMode(){ return DATA.settings.sortMode||'smart'; }
-
 async function bootstrap(){
   try{
     const list=await api.list();
@@ -630,30 +726,24 @@ async function bootstrap(){
     console.warn('API unavailable, using local data:', e && e.message);
   }
 }
-
 function upsert(r){
   r.updatedAt=nowIso();
   const i=DATA.restaurants.findIndex(x=>String(x.id)===String(r.id));
   if(i>=0) DATA.restaurants[i]=r; else DATA.restaurants.push(r);
-  persist();
-  syncUpsert(r);
+  persist(); syncUpsert(r);
 }
 function isServerId(id){ return typeof id==='number' || /^[0-9]+$/.test(String(id)); }
 async function syncUpsert(r){
   try{
-    if(isServerId(r.id)){
-      await api.update(r.id, toApiPayload(r));
-    }else{
-      const tempId=r.id;
-      const created=await api.create(toApiPayload(r));
+    if(isServerId(r.id)){ await api.update(r.id, toApiPayload(r)); }
+    else{
+      const tempId=r.id; const created=await api.create(toApiPayload(r));
       if(created && created.id!=null){
         const rec=DATA.restaurants.find(x=>String(x.id)===String(tempId));
         if(rec){ rec.id=created.id; }
         if(UI.lastChosenId===tempId) UI.lastChosenId=created.id;
         if(UI.screen && UI.screen.kind==='detail' && String(UI.screen.id)===String(tempId)) UI.screen.id=created.id;
-        pendingSync.delete(tempId);
-        persist();
-        if(typeof render==='function') render();
+        pendingSync.delete(tempId); persist(); if(typeof render==='function') render();
       }
     }
   }catch(e){ pendingSync.add(r.id); console.warn('sync upsert failed:', e && e.message); }
@@ -661,9 +751,7 @@ async function syncUpsert(r){
 function setNextUp(id){
   const prev=DATA.restaurants.find(r=>r.nextUp && String(r.id)!==String(id));
   DATA.restaurants.forEach(r=>{ r.nextUp=(String(r.id)===String(id)); });
-  persist();
-  const cur=getR(id); if(cur) syncUpsert(cur);
-  if(prev) syncUpsert(prev);
+  persist(); const cur=getR(id); if(cur) syncUpsert(cur); if(prev) syncUpsert(prev);
   return prev?prev.id:null;
 }
 function clearNextUp(id){ const r=getR(id); if(r){ r.nextUp=false; persist(); syncUpsert(r); } }
@@ -884,6 +972,7 @@ function renderHome(){
   (UI.filters.occasions||[]).forEach(o=>fchips.push(chipRemove(o,'occ',o)));
   UI.filters.areas.forEach(a=>fchips.push(chipRemove(a,'a',a)));
   UI.filters.price.forEach(p=>fchips.push(chipRemove(priceStr(p),'p',p)));
+  if(UI.filters.openNow) fchips.push(chipRemove('פתוח עכשיו','open',''));
   if(UI.filters.happyHour) fchips.push(chipRemove('Happy Hour','hh',''));
 
   let html='<div class="scroll noscroll" id="homescroll">';
@@ -1097,12 +1186,17 @@ function renderDetail(id){
   if(r.deliveryUrl) det.push('<button class="nd-detrow tap" data-act="delivery" data-id="'+r.id+'"><span class="dlabel">משלוח</span><span class="dval"><span>'+esc(String(r.deliveryUrl).replace(/^https?:\/\//,'').replace(/\/$/,''))+'</span>'+uic('ic-delivery',17)+'</span></button>');
   if(address) det.push('<button class="nd-detrow tap" data-act="nav" data-id="'+r.id+'"><span class="dlabel">כתובת</span><span class="dval"><span>'+esc(address)+'</span>'+uic('ic-navpin',17)+'</span></button>');
   if(r.openingHours){
-    // Opening hours may hold several day/time segments (comma-separated) — show them stacked and readable.
-    const segs=String(r.openingHours).split(/[,،]|\n/).map(s=>s.trim()).filter(Boolean);
-    const hoursVal = segs.length>1
-      ? '<span class="nd-hours-list">'+segs.map(s=>'<span>'+esc(s)+'</span>').join('')+'</span>'
-      : '<span>'+esc(r.openingHours)+'</span>';
-    det.push('<div class="nd-detrow'+(segs.length>1?' nd-detrow-hours':'')+'"><span class="dlabel">שעות פתיחה</span><span class="dval">'+hoursVal+uic('ic-clock',17)+'</span></div>');
+    const rows=openingHoursRows(r.openingHours);
+    if(rows.length){
+      const open=isOpenNow(r,new Date());
+      const status = open===true? '<span class="nd-open-badge open">פתוח עכשיו</span>'
+                    : open===false? '<span class="nd-open-badge closed">סגור עכשיו</span>' : '';
+      const body = rows.map(row=> row.hours
+        ? '<div class="nd-hrow"><span class="nd-hdays">'+esc(row.days)+'</span><span class="nd-htime">'+esc(row.hours)+'</span></div>'
+        : '<div class="nd-hrow nd-hrow-free"><span>'+esc(row.days)+'</span></div>'
+      ).join('');
+      det.push('<div class="nd-detrow nd-detrow-hours"><div class="nd-hours-head"><span class="dlabel">שעות פתיחה'+status+'</span>'+uic('ic-clock',17)+'</div><div class="nd-hours-grid">'+body+'</div></div>');
+    }
   }
   let detHtml = det.length? '<div class="nd-card nd-details"><div class="nd-card-hd"><h3>פרטים</h3></div>'+det.join('')+'</div>':'';
 
@@ -1237,7 +1331,7 @@ document.addEventListener('keydown',e=>{ if(e.key==='Escape') closeModal(); });
 /* ---- Filter sheet ---- */
 function openFilter(){
   const all=liveList(); const now=new Date();
-  const tmp={visitStatus:UI.filters.visitStatus.slice(),cuisines:UI.filters.cuisines.slice(),occasions:(UI.filters.occasions||[]).slice(),areas:UI.filters.areas.slice(),price:UI.filters.price.slice(),happyHour:UI.filters.happyHour};
+  const tmp={visitStatus:UI.filters.visitStatus.slice(),cuisines:UI.filters.cuisines.slice(),occasions:(UI.filters.occasions||[]).slice(),areas:UI.filters.areas.slice(),price:UI.filters.price.slice(),happyHour:UI.filters.happyHour,openNow:UI.filters.openNow};
   let tmpSort=sortMode();
   const exp={cuisine:false,suit:false,area:false};
   // sources of truth
@@ -1287,6 +1381,9 @@ function openFilter(){
       +'<div class="fsec"><h3>מחיר</h3><div class="fchips">'
         +[1,2,3,4].map(p=>chip(String(p),priceStr(p),uic('ic-coin'+p,18)+' ',tmp.price.includes(p),'p')).join('')
       +'</div></div>'
+      +'<div class="fsec"><h3>זמינות</h3><div class="fchips">'
+        +chip('1','פתוח עכשיו',uic('ic-clock',18)+' ',tmp.openNow,'open')
+      +'</div></div>'
       +'<div class="fsec"><h3>Happy Hour</h3><div class="fchips">'
         +chip('1','יש Happy Hour',uic('bg-happyhour',18)+' ',tmp.happyHour,'hh')
       +'</div></div>'
@@ -1312,11 +1409,11 @@ function openFilter(){
       const tog=(arr,val)=>{const i=arr.findIndex(x=>String(x)===String(val)); if(i>=0)arr.splice(i,1); else arr.push(val);};
       const togN=(arr,val)=>{const i=arr.findIndex(x=>normalize(x)===normalize(val)); if(i>=0)arr.splice(i,1); else arr.push(val);};
       if(t==='vs')tog(tmp.visitStatus,v); else if(t==='c')togN(tmp.cuisines,v); else if(t==='occ')togN(tmp.occasions,v); else if(t==='a')togN(tmp.areas,v);
-      else if(t==='p')tog(tmp.price,+v); else if(t==='hh')tmp.happyHour=!tmp.happyHour;
+      else if(t==='p')tog(tmp.price,+v); else if(t==='hh')tmp.happyHour=!tmp.happyHour; else if(t==='open')tmp.openNow=!tmp.openNow;
       draw(); return;
     }
     if(b.dataset.sort){ tmpSort=b.dataset.sort; draw(); return; }
-    if(b.dataset.clear){ tmp.visitStatus=[];tmp.cuisines=[];tmp.occasions=[];tmp.areas=[];tmp.price=[];tmp.happyHour=false; draw(); return; }
+    if(b.dataset.clear){ tmp.visitStatus=[];tmp.cuisines=[];tmp.occasions=[];tmp.areas=[];tmp.price=[];tmp.happyHour=false;tmp.openNow=false; draw(); return; }
     if(b.dataset.apply){ UI.filters=tmp; DATA.settings.sortMode=tmpSort; persist(); closeModal(); nbResultsPending=true; render(); return; }
   });
   openModal(node,false);
@@ -1414,8 +1511,7 @@ function openDelete(id){
     closeModal(); go({kind:'home'});
     const delId=r.id;
     if(isServerId(delId)){
-      const h=setTimeout(()=>{
-        pendingDelete.delete(delId);
+      const h=setTimeout(()=>{ pendingDelete.delete(delId);
         const idx=DATA.restaurants.findIndex(x=>String(x.id)===String(delId));
         if(idx>=0 && DATA.restaurants[idx].deleted){ DATA.restaurants.splice(idx,1); persist(); }
         api.remove(delId).catch(e=>console.warn('delete sync failed:', e && e.message));
@@ -1856,7 +1952,7 @@ document.body.addEventListener('click',e=>{
       else if(t==='occ')f.occasions=(f.occasions||[]).filter(x=>normalize(x)!==normalize(v));
       else if(t==='a')f.areas=f.areas.filter(x=>normalize(x)!==normalize(v));
       else if(t==='p')f.price=f.price.filter(x=>String(x)!==v && '₪'.repeat(x)!==v);
-      else if(t==='hh')f.happyHour=false; nbResultsPending=true; render();break;}
+      else if(t==='hh')f.happyHour=false; else if(t==='open')f.openNow=false; nbResultsPending=true; render();break;}
     case 'star': {closePop();const r=getR(id);if(!r)break; if(r.nextUp){clearNextUp(id);snackbar(r.name+' הוחזרה לרשימה','ביטול',()=>{setNextUp(id);render();},6000);}else{const prev=setNextUp(id);snackbar(r.name+' עכשיו הבא בתור','ביטול',()=>{clearNextUp(id);if(prev)setNextUp(prev);render();},6000);} render();break;}
     case 'nav': {const r=getR(id);if(r)actNav(r);break;}
     case 'web': {const r=getR(id);if(r)openExternal(r.website);break;}
@@ -1916,6 +2012,6 @@ function seed(){
 }
 
 /* ================= INIT ================= */
-render();          // paint immediately from local cache
-bootstrap();       // then load real data from the D1-backed API and re-render
+render();
+bootstrap();
 })();
